@@ -226,21 +226,111 @@ import path2 from "path";
 
 // src/exec.ts
 var DEFAULT_TIMEOUT_MS2 = 30000;
+var OUTPUT_LIMIT_BYTES = 262144;
+function capture(stream, onOverflow) {
+  if (stream === undefined) {
+    return { captured: Promise.resolve({ text: "", overflowed: false }), release: () => {} };
+  }
+  const reader = stream.getReader();
+  const drain = async () => {
+    const chunks = [];
+    let total = 0;
+    let overflowed = false;
+    try {
+      for (;; ) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        const room = OUTPUT_LIMIT_BYTES - total;
+        if (value.byteLength > room) {
+          chunks.push(value.subarray(0, room));
+          total = OUTPUT_LIMIT_BYTES;
+          overflowed = true;
+          onOverflow();
+          break;
+        }
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { text: new TextDecoder().decode(bytes), overflowed };
+  };
+  return {
+    captured: drain(),
+    release: () => {
+      reader.cancel().catch(() => {});
+    }
+  };
+}
+async function deadlineWon(work, deadline) {
+  if (deadline.aborted)
+    return true;
+  const expired = new Promise((resolve) => {
+    deadline.addEventListener("abort", () => resolve(true), { once: true });
+  });
+  return await Promise.race([work.then(() => false), expired]);
+}
 async function run(argv, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS2;
+  const name = argv[0] ?? "the process";
   try {
+    const deadline = AbortSignal.timeout(timeoutMs);
     const child = Bun.spawn([...argv], {
       stdout: "pipe",
       stderr: "pipe",
       stdin: "ignore",
-      timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS2,
+      signal: deadline,
+      detached: true,
       ...options.cwd === undefined ? {} : { cwd: options.cwd }
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
-      child.exited
-    ]);
-    return { ok: exitCode === 0, exitCode, stdout, stderr };
+    const reap = (signal) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch {}
+      child.kill(signal);
+    };
+    const stopFlood = () => {
+      reap("SIGTERM");
+    };
+    const stdout = capture(child.stdout, stopFlood);
+    const stderr = capture(child.stderr, stopFlood);
+    const drained = Promise.all([stdout.captured, stderr.captured]);
+    const overran = await deadlineWon(Promise.all([drained, child.exited]), deadline);
+    if (overran) {
+      reap("SIGKILL");
+      stdout.release();
+      stderr.release();
+    }
+    const [out, err] = await drained;
+    const exitCode = await child.exited;
+    if (overran) {
+      return {
+        ok: false,
+        exitCode,
+        stdout: out.text,
+        stderr: err.text,
+        spawnError: `${name} did not finish within ${timeoutMs}ms and was killed`
+      };
+    }
+    if (out.overflowed || err.overflowed) {
+      const flooded = out.overflowed ? "stdout" : "stderr";
+      return {
+        ok: false,
+        exitCode,
+        stdout: out.text,
+        stderr: err.text,
+        spawnError: `${name} wrote more than ${OUTPUT_LIMIT_BYTES} bytes to ${flooded} and was killed`
+      };
+    }
+    return { ok: exitCode === 0, exitCode, stdout: out.text, stderr: err.text };
   } catch (error) {
     return {
       ok: false,
