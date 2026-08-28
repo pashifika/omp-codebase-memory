@@ -13,7 +13,7 @@ specification in the same change.
 
 `omp-codebase-memory` distributes `codebase-memory-mcp` (CBM) as an installable
 OMP extension. It is TypeScript on Bun, has no npm runtime dependencies, and
-commits its bundled entry point at `dist/index.js`.
+commits its bundled entry points at `dist/index.js` and `dist/augment.js`.
 
 The following boundaries are fixed:
 
@@ -87,8 +87,9 @@ no jobs, and accepts only successful dependencies.
 - Run checks through package scripts and print toolchain versions with results.
 - Do not add a Node job; Node is not a supported runtime.
 
-`dist/index.js` is committed. CI must build from source and compare the result
-byte-for-byte with that tracked bundle.
+`dist/index.js` and the feature entry `dist/augment.js` are committed. CI must
+read the bundle list from `package.json`'s extension entries, build from
+source, and compare each result byte-for-byte with its tracked bundle.
 
 A release tag must match `package.json`'s version and both the version and source
 ref in `.omp-plugin/marketplace.json`. Create releases only from verified tags.

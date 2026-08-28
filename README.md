@@ -33,9 +33,9 @@ and a `grep` that missed a structural answer gets it appended anyway.
   uninstall. No other user file is touched.
 - **Tracks versions without fighting CBM's own updater.** A managed copy is
   updated by this package. An adopted system copy is only reported on.
-- **Ships a skill, a rulebook rule, and three agents.** All four are derived
-  from the CBM executable rather than written by hand, so the guidance a session
-  gets is the guidance that release actually documents.
+- **Ships a skill, a rulebook rule, and three agents.** All five files are
+  derived from the CBM executable rather than written by hand, so the guidance a
+  session gets is the guidance that release actually documents.
 - **Appends graph context to searches and reads.** Matching symbols on a `grep`
   or `glob`, index-coverage gaps on a `read`. Optional, bounded, and it can only
   ever add.
@@ -115,13 +115,13 @@ one that already works.
 
 ## Graph context
 
-Four surfaces, all derived from the CBM executable by `bun run harvest` and
-committed:
+Three surfaces across five committed files, all derived from the CBM executable
+by `bun run harvest`:
 
 | Surface | Path | What it gives a session |
 |---|---|---|
 | Skill | `skills/codebase-memory/SKILL.md` | The tool matrix, the exploration and tracing workflows, the Cypher examples, and the gotchas. Read on demand as `skill://codebase-memory` |
-| Rule | `rules/codebase-memory.md` | The priority order and the evidence tiers, injected into every turn, so a fresh session and a post-compaction turn both carry it |
+| Rule | `rules/codebase-memory.md` | The priority order and the evidence tiers. Listed in the rulebook by name and description, and read on demand as `rule://codebase-memory` |
 | Agents | `agents/codebase-memory{,-scout,-auditor}.md` | CBM's Scout, Verify, and Auditor tiers, as read-only subagents that verify supplied evidence against exact source |
 
 The agents declare `tools: read, grep, glob` and name no MCP tool. Their prompt
@@ -242,7 +242,7 @@ configuration.
 ## Staying in step with CBM
 
 The shipped skill, rule, and agents belong to a specific CBM release.
-`harvest.json` records which one:
+`harvest.json` records which one, in these three fields:
 
 ```json
 {
@@ -251,6 +251,9 @@ The shipped skill, rule, and agents belong to a specific CBM release.
   "sourceClients": ["claude", "augment"]
 }
 ```
+
+A fourth field, `generated`, lists every path the pipeline owns, so the file
+also states what a regeneration is allowed to overwrite.
 
 If you run a newer CBM than that, two detectors tell you, in this order.
 
