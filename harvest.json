@@ -1,0 +1,16 @@
+{
+  "cbmVersion": "0.10.8",
+  "reportedVersion": "codebase-memory-mcp 0.10.8",
+  "sourceClients": [
+    "claude",
+    "augment"
+  ],
+  "generated": [
+    "agents/codebase-memory-auditor.md",
+    "agents/codebase-memory-scout.md",
+    "agents/codebase-memory.md",
+    "rules/codebase-memory.md",
+    "skills/codebase-memory/SKILL.md",
+    "harvest.json"
+  ]
+}

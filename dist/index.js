@@ -2,6 +2,360 @@
 // src/index.ts
 import { existsSync } from "fs";
 
+// src/exec.ts
+var DEFAULT_TIMEOUT_MS = 30000;
+var OUTPUT_LIMIT_BYTES = 262144;
+function capture(stream, onOverflow) {
+  if (stream === undefined) {
+    return { captured: Promise.resolve({ text: "", overflowed: false }), release: () => {} };
+  }
+  const reader = stream.getReader();
+  const drain = async () => {
+    const chunks = [];
+    let total = 0;
+    let overflowed = false;
+    try {
+      for (;; ) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        const room = OUTPUT_LIMIT_BYTES - total;
+        if (value.byteLength > room) {
+          chunks.push(value.subarray(0, room));
+          total = OUTPUT_LIMIT_BYTES;
+          overflowed = true;
+          onOverflow();
+          break;
+        }
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { text: new TextDecoder().decode(bytes), overflowed };
+  };
+  return {
+    captured: drain(),
+    release: () => {
+      reader.cancel().catch(() => {});
+    }
+  };
+}
+async function deadlineWon(work, deadline) {
+  if (deadline.aborted)
+    return true;
+  const expired = new Promise((resolve) => {
+    deadline.addEventListener("abort", () => resolve(true), { once: true });
+  });
+  return await Promise.race([work.then(() => false), expired]);
+}
+async function run(argv, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const name = argv[0] ?? "the process";
+  try {
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const child = Bun.spawn([...argv], {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+      signal: deadline,
+      detached: true,
+      ...options.cwd === undefined ? {} : { cwd: options.cwd },
+      ...options.env === undefined ? {} : { env: { ...process.env, ...options.env } }
+    });
+    const reap = (signal) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch {}
+      child.kill(signal);
+    };
+    const stopFlood = () => {
+      reap("SIGTERM");
+    };
+    const stdout = capture(child.stdout, stopFlood);
+    const stderr = capture(child.stderr, stopFlood);
+    const drained = Promise.all([stdout.captured, stderr.captured]);
+    const overran = await deadlineWon(Promise.all([drained, child.exited]), deadline);
+    if (overran) {
+      reap("SIGKILL");
+      stdout.release();
+      stderr.release();
+    }
+    const [out, err] = await drained;
+    const exitCode = await child.exited;
+    if (overran) {
+      return {
+        ok: false,
+        exitCode,
+        stdout: out.text,
+        stderr: err.text,
+        spawnError: `${name} did not finish within ${timeoutMs}ms and was killed`
+      };
+    }
+    if (out.overflowed || err.overflowed) {
+      const flooded = out.overflowed ? "stdout" : "stderr";
+      return {
+        ok: false,
+        exitCode,
+        stdout: out.text,
+        stderr: err.text,
+        spawnError: `${name} wrote more than ${OUTPUT_LIMIT_BYTES} bytes to ${flooded} and was killed`
+      };
+    }
+    return { ok: exitCode === 0, exitCode, stdout: out.text, stderr: err.text };
+  } catch (error) {
+    return {
+      ok: false,
+      exitCode: -1,
+      stdout: "",
+      stderr: "",
+      spawnError: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+async function readVersion(executable) {
+  const result = await run([executable, "--version"], { timeoutMs: 1e4 });
+  if (!result.ok)
+    return null;
+  const reported = `${result.stdout}${result.stderr}`.trim();
+  return reported === "" ? null : reported.split(`
+`)[0]?.trim() ?? null;
+}
+function haveTool(tool, pathEnv) {
+  return Bun.which(tool, pathEnv === undefined ? {} : { PATH: pathEnv }) !== null;
+}
+
+// src/graph.ts
+var HANDSHAKE_TIMEOUT_MS = 20000;
+var QUERY_TIMEOUT_MS = 300;
+var COMMAND_TIMEOUT_MS = 1e4;
+var REOPEN_LIMIT = 2;
+var PROTOCOL_VERSION = "2024-11-05";
+var EXPIRED = Symbol("deadline");
+function openGraphClient(executable, options = {}) {
+  const queryTimeoutMs = options.queryTimeoutMs ?? QUERY_TIMEOUT_MS;
+  const totalTimeoutMs = options.totalTimeoutMs;
+  const debug = options.onDebug ?? (() => {});
+  let expiresAt = null;
+  const budgeted = (timeoutMs) => {
+    if (totalTimeoutMs === undefined)
+      return timeoutMs;
+    expiresAt ??= Date.now() + totalTimeoutMs;
+    return Math.max(0, Math.min(timeoutMs, expiresAt - Date.now()));
+  };
+  let child = null;
+  let handshake = null;
+  let established = false;
+  let declined = false;
+  let opens = 0;
+  let closed = false;
+  let nextId = 0;
+  const pending = new Map;
+  const teardown = (reason, owner) => {
+    if (owner !== child)
+      return;
+    for (const settle of pending.values())
+      settle({ error: { message: reason } });
+    pending.clear();
+    const dying = child;
+    child = null;
+    handshake = null;
+    established = false;
+    if (dying === null)
+      return;
+    try {
+      dying.stdin.end();
+    } catch {}
+    try {
+      dying.kill();
+    } catch {}
+  };
+  const drain = (owner, stream, onLine) => {
+    (async () => {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder;
+      let buffer = "";
+      try {
+        for (;; ) {
+          const { done, value } = await reader.read();
+          if (done)
+            break;
+          if (onLine === null)
+            continue;
+          buffer += decoder.decode(value, { stream: true });
+          if (buffer.length > OUTPUT_LIMIT_BYTES) {
+            teardown(`the graph session wrote more than ${OUTPUT_LIMIT_BYTES} bytes without a complete line`, owner);
+            return;
+          }
+          let newline = buffer.indexOf(`
+`);
+          while (newline >= 0) {
+            onLine(buffer.slice(0, newline));
+            buffer = buffer.slice(newline + 1);
+            newline = buffer.indexOf(`
+`);
+          }
+        }
+      } catch (error) {
+        debug(`graph session read failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        await reader.cancel().catch(() => {});
+        if (onLine !== null)
+          teardown("the graph session ended", owner);
+      }
+    })();
+  };
+  const receive = (line) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (typeof parsed !== "object" || parsed === null || !("id" in parsed))
+      return;
+    const id = parsed.id;
+    if (typeof id !== "number")
+      return;
+    const settle = pending.get(id);
+    if (settle === undefined)
+      return;
+    pending.delete(id);
+    settle(parsed);
+  };
+  const request = async (method, params, timeoutMs) => {
+    const active = child;
+    if (active === null)
+      return null;
+    const id = ++nextId;
+    const bound = budgeted(timeoutMs);
+    const answered = Promise.withResolvers();
+    pending.set(id, answered.resolve);
+    const deadline = AbortSignal.timeout(bound);
+    const expired = Promise.withResolvers();
+    deadline.addEventListener("abort", () => expired.resolve(EXPIRED), { once: true });
+    try {
+      active.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}
+`);
+      await active.stdin.flush();
+    } catch (error) {
+      pending.delete(id);
+      teardown(`the graph session would not accept a request: ${error instanceof Error ? error.message : String(error)}`, active);
+      return null;
+    }
+    const response = await Promise.race([answered.promise, expired.promise]);
+    if (response === EXPIRED) {
+      pending.delete(id);
+      teardown(`${method} did not answer within ${bound}ms`, active);
+      debug(`graph query ${method} exceeded ${bound}ms`);
+      return null;
+    }
+    if (typeof response !== "object" || response === null)
+      return null;
+    if ("error" in response) {
+      const failure = response.error;
+      const reported = typeof failure === "object" && failure !== null && "message" in failure && typeof failure.message === "string" ? failure.message : "unknown";
+      debug(`graph query ${method} failed: ${reported}`);
+      return null;
+    }
+    return "result" in response ? response.result ?? null : null;
+  };
+  const open = async () => {
+    let started;
+    try {
+      started = Bun.spawn([executable], { stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+    } catch (error) {
+      debug(`graph session would not start: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+    child = started;
+    drain(started, started.stdout, receive);
+    drain(started, started.stderr, null);
+    const initialized = await request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "omp-codebase-memory", version: "0" }
+    }, HANDSHAKE_TIMEOUT_MS);
+    if (initialized === null) {
+      teardown("the graph session did not complete its handshake", started);
+      return false;
+    }
+    if (child !== started)
+      return false;
+    try {
+      started.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}
+`);
+      await started.stdin.flush();
+    } catch (error) {
+      teardown("the graph session would not accept the initialized notification: " + `${error instanceof Error ? error.message : String(error)}`, started);
+      return false;
+    }
+    if (child !== started)
+      return false;
+    established = true;
+    return true;
+  };
+  const ready = async () => {
+    if (closed || declined)
+      return false;
+    const inFlight = handshake;
+    if (inFlight !== null)
+      return await inFlight;
+    if (opens > REOPEN_LIMIT)
+      return false;
+    opens += 1;
+    const started = open();
+    handshake = started;
+    const opened = await started;
+    if (!opened) {
+      declined = true;
+      if (handshake === started)
+        handshake = null;
+    }
+    return opened;
+  };
+  const readyNow = () => {
+    ready().catch(() => {});
+    return established;
+  };
+  return {
+    async call(tool, args) {
+      if (!readyNow())
+        return null;
+      const result = await request("tools/call", { name: tool, arguments: args }, queryTimeoutMs);
+      if (typeof result !== "object" || result === null)
+        return null;
+      if ("isError" in result && result.isError === true) {
+        debug(`graph tool ${tool} reported an error`);
+        return null;
+      }
+      return "structuredContent" in result ? result.structuredContent ?? null : null;
+    },
+    async toolNames() {
+      if (!await ready())
+        return null;
+      const result = await request("tools/list", {}, HANDSHAKE_TIMEOUT_MS);
+      if (typeof result !== "object" || result === null || !("tools" in result))
+        return null;
+      const tools = result.tools;
+      if (!Array.isArray(tools))
+        return null;
+      return tools.map((tool) => typeof tool === "object" && tool !== null && ("name" in tool) ? tool.name : undefined).filter((name) => typeof name === "string");
+    },
+    close() {
+      closed = true;
+      teardown("the graph session was closed", child);
+    }
+  };
+}
+
 // src/platform.ts
 import { cpus } from "os";
 
@@ -107,12 +461,71 @@ function upstreamInstallDir(host) {
   return path.join(host.home, ".local", "bin");
 }
 
+// src/project.ts
+import path2 from "path";
+function selectProject(projects, cwd) {
+  const directory = path2.resolve(cwd);
+  let best = null;
+  for (const candidate of projects) {
+    const root = path2.resolve(candidate.root);
+    if (root !== directory && !directory.startsWith(root.endsWith(path2.sep) ? root : `${root}${path2.sep}`))
+      continue;
+    if (best === null || path2.resolve(best.root).length < root.length)
+      best = candidate;
+  }
+  return best;
+}
+function readProjects(structured) {
+  if (typeof structured !== "object" || structured === null || !("projects" in structured))
+    return null;
+  const listed = structured.projects;
+  if (!Array.isArray(listed))
+    return null;
+  const projects = [];
+  for (const entry of listed) {
+    if (typeof entry !== "object" || entry === null)
+      continue;
+    if (!("name" in entry) || !("root_path" in entry))
+      continue;
+    const { name, root_path: root } = entry;
+    if (typeof name !== "string" || typeof root !== "string" || name === "" || root === "")
+      continue;
+    projects.push({ name, root });
+  }
+  return projects;
+}
+function projectResolver(client, cwd) {
+  let settled = null;
+  let inFlight = null;
+  return {
+    async resolve() {
+      if (settled !== null)
+        return settled;
+      inFlight ??= (async () => {
+        try {
+          const projects = readProjects(await client.call("list_projects", {}));
+          if (projects === null)
+            return { kind: "unavailable" };
+          const project = selectProject(projects, cwd);
+          return project === null ? { kind: "unindexed" } : { kind: "project", project };
+        } finally {
+          inFlight = null;
+        }
+      })();
+      const answer = await inFlight;
+      if (answer.kind !== "unavailable")
+        settled = answer;
+      return answer;
+    }
+  };
+}
+
 // src/release.ts
 var UPSTREAM_REPO = "DeusData/codebase-memory-mcp";
 var RELEASES = `https://github.com/${UPSTREAM_REPO}/releases`;
 var LATEST = `${RELEASES}/latest`;
 var MAX_REDIRECTS = 5;
-var DEFAULT_TIMEOUT_MS = 20000;
+var DEFAULT_TIMEOUT_MS2 = 20000;
 var CHECKSUMS_LIMIT_BYTES = 1048576;
 async function fetchHttps(url, options = {}) {
   const budget = Math.min(options.maxRedirects ?? MAX_REDIRECTS, MAX_REDIRECTS);
@@ -120,7 +533,7 @@ async function fetchHttps(url, options = {}) {
   for (let hop = 0;; hop++) {
     const response = await fetch(current, {
       redirect: "manual",
-      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS2),
       headers: { accept: "*/*" }
     });
     const redirected = response.status >= 300 && response.status < 400;
@@ -245,6 +658,121 @@ async function readBounded(body, limitBytes, what) {
   return joined;
 }
 
+// src/state.ts
+import { randomUUID } from "crypto";
+import { chmod, mkdir, rename, rm, stat } from "fs/promises";
+import path3 from "path";
+var EMPTY = {};
+async function readState(host) {
+  const file = Bun.file(statePath(host));
+  let text;
+  try {
+    text = await file.text();
+  } catch {
+    return EMPTY;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return EMPTY;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return EMPTY;
+  const record = parsed;
+  const state = {};
+  for (const key of ["managedVersion", "managedDigest", "pin", "upstreamVersion", "wroteCommand"]) {
+    const value = record[key];
+    if (typeof value === "string" && value !== "")
+      state[key] = value;
+  }
+  const lastCheckedAt = record["lastCheckedAt"];
+  if (typeof lastCheckedAt === "number" && Number.isFinite(lastCheckedAt)) {
+    state["lastCheckedAt"] = lastCheckedAt;
+  }
+  return state;
+}
+async function writeState(host, next) {
+  const file = statePath(host);
+  await mkdir(path3.dirname(file), { recursive: true });
+  const staging = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    let mode = 384;
+    try {
+      mode = (await stat(file)).mode & 511;
+    } catch (error) {
+      const code = error?.code;
+      if (code !== "ENOENT")
+        throw error;
+    }
+    await Bun.write(staging, `${JSON.stringify(next, null, 2)}
+`);
+    await chmod(staging, mode);
+    await rename(staging, file);
+  } catch (error) {
+    await rm(staging, { force: true });
+    throw error;
+  }
+}
+async function updateState(host, patch) {
+  const next = { ...await readState(host), ...patch };
+  await writeState(host, next);
+  return next;
+}
+
+// src/resolve.ts
+import path4 from "path";
+var NO_EXECUTABLE_REASON = `no ${EXECUTABLE_NAME} executable found on PATH, in ~/.local/bin, or under this package's own root. ` + "Run /cbm install to download a managed copy, or install it yourself with " + "`curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash` " + "and this package will adopt it.";
+async function managedCopy(host, state) {
+  const recorded = (state ?? await readState(host)).managedVersion;
+  if (recorded === undefined)
+    return null;
+  const executable = managedExecutable(host, recorded);
+  return await Bun.file(executable).exists() ? { version: recorded, executable } : null;
+}
+async function resolveExecutable(host, state) {
+  const current = state ?? await readState(host);
+  const pin = current.pin;
+  if (pin !== undefined) {
+    const pinned = managedExecutable(host, pin);
+    if (await Bun.file(pinned).exists()) {
+      return { ok: true, resolved: { executable: pinned, source: "pin", origin: pin } };
+    }
+  }
+  const onPath = Bun.which(EXECUTABLE_NAME, pathOption(host));
+  if (onPath !== null) {
+    return {
+      ok: true,
+      resolved: { executable: path4.resolve(onPath), source: "system", origin: "PATH" }
+    };
+  }
+  const upstream = path4.join(upstreamInstallDir(host), EXECUTABLE_NAME);
+  if (await Bun.file(upstream).exists()) {
+    return {
+      ok: true,
+      resolved: { executable: upstream, source: "system", origin: "~/.local/bin" }
+    };
+  }
+  const managed = await managedCopy(host, current);
+  if (managed !== null) {
+    return {
+      ok: true,
+      resolved: {
+        executable: managed.executable,
+        source: "managed",
+        origin: path4.join(path4.basename(managedBinRoot(host)), managed.version)
+      }
+    };
+  }
+  return { ok: false, reason: NO_EXECUTABLE_REASON };
+}
+async function resolvedVersion(resolved) {
+  return await readVersion(resolved.executable);
+}
+function pathOption(host) {
+  return { PATH: host.env["PATH"] ?? "" };
+}
+
 // src/scheduler.ts
 function schedulerFrom(ctx) {
   return {
@@ -257,144 +785,142 @@ function schedulerFrom(ctx) {
   };
 }
 
+// skills/codebase-memory/SKILL.md
+var SKILL_default = `---
+name: "codebase-memory"
+description: "Use the codebase knowledge graph for structural code queries. Triggers on: explore the codebase, understand the architecture, what functions exist, show me the structure, who calls this function, what does X call, trace the call chain, find callers of, show dependencies, impact analysis, dead code, unused functions, high fan-out, refactor candidates, code quality audit, graph query syntax, Cypher query examples, edge types, how to use search_graph."
+---
+
+# Codebase Memory \u2014 Knowledge Graph Tools
+
+Graph tools return precise structural results in ~500 tokens vs ~80K for grep.
+
+## Quick Decision Matrix
+
+| Question | Tool call |
+|----------|----------|
+| Who calls X? | \`trace_path(direction="inbound")\` |
+| What does X call? | \`trace_path(direction="outbound")\` |
+| Full call context | \`trace_path(direction="both")\` |
+| Find by name pattern | \`search_graph(name_pattern="...")\` |
+| Dead code | \`search_graph(max_degree=0, exclude_entry_points=true)\` |
+| Cross-service edges | \`query_graph\` with Cypher |
+| Impact of local changes | \`detect_changes()\` |
+| Risk-classified trace | \`trace_path(risk_labels=true)\` |
+| Text search | \`search_code\` or Grep |
+
+## Exploration Workflow
+1. \`list_projects\` \u2014 check if project is indexed
+2. \`get_graph_schema\` \u2014 understand node/edge types
+3. \`search_graph(label="Function", name_pattern=".*Pattern.*")\` \u2014 find code
+4. \`get_code_snippet(qualified_name="project.path.FuncName")\` \u2014 read source
+
+## Tracing Workflow
+1. \`search_graph(name_pattern=".*FuncName.*")\` \u2014 discover exact name
+2. \`trace_path(function_name="FuncName", direction="both", depth=3)\` \u2014 trace
+3. \`detect_changes()\` \u2014 map git diff to affected symbols
+
+## Evidence Tiers
+- **Scout (Tier 1):** fast positive lookup with few graph calls and targeted source checks. Treat results as provisional; never make absence, exhaustive, dead-code, or complete-impact claims.
+- **Verify (Tier 2, default):** task-directed searches, relevant trace directions, exact snippets for material claims, and all relevant result pages.
+- **Auditor (Tier 3):** bounded-scope full verification with a current graph generation, complete relevant pagination, both call directions and broader relationships when material, plus explicit unresolved limitations.
+- **Every tier:** after candidate paths are known, call \`check_index_coverage\` once with every evidence path. For negative or exhaustive claims also include the relevant scopes. A clean result means no recorded gap, not proof of completeness. For partial, skipped, excluded, stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying on the graph.
+
+## Sessions and Subagents
+- At session start or after compaction, call \`list_projects\`/\`index_status\` before structural exploration, then choose Scout, Verify, or Auditor for the task.
+- Before delegating, query the graph and coverage in the parent. Pass the tier, exact project, generation/freshness, bounded scope, queries and pagination state, qualified symbols, paths, call-chain findings, coverage ranges/reasons, source fallback already performed, and unresolved questions to the child.
+- Runtimes such as Hermes isolate child context: put those graph findings in the \`context\` argument to \`delegate_task\`; do not assume the child inherits MCP access or the parent's conversation.
+- A child without MCP tools must not call or claim MCP access. It should work from the supplied evidence and use read/grep on exact source, especially every reported missed-coverage range.
+
+## Quality Analysis
+- Dead code: \`search_graph(max_degree=0, exclude_entry_points=true)\`
+- High fan-out: \`search_graph(min_degree=10, relationship="CALLS", direction="outbound")\`
+- High fan-in: \`search_graph(min_degree=10, relationship="CALLS", direction="inbound")\`
+
+## 15 MCP Tools
+\`index_repository\`, \`index_status\`, \`list_projects\`, \`delete_project\`,
+\`search_graph\`, \`search_code\`, \`trace_path\`, \`detect_changes\`,
+\`query_graph\`, \`get_graph_schema\`, \`get_code_snippet\`, \`get_architecture\`,
+\`check_index_coverage\`, \`manage_adr\`, \`ingest_traces\`
+
+## Edge Types
+CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,
+HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, FILE_CHANGES_WITH,
+SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,
+CONTAINS_PACKAGE
+
+## Cypher Examples (for query_graph)
+\`\`\`
+MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, r.confidence LIMIT 20
+MATCH (f:Function) WHERE f.name =~ '.*Handler.*' RETURN f.name, f.file_path
+MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'main' RETURN b.name
+\`\`\`
+
+## Gotchas
+1. \`search_graph(relationship="HTTP_CALLS")\` filters nodes by degree \u2014 use \`query_graph\` with Cypher to see actual edges.
+2. \`query_graph\` has a 100k row ceiling \u2014 add a Cypher \`LIMIT\` for broad queries or use \`search_graph\` pagination.
+3. \`trace_path\` needs exact names \u2014 use \`search_graph(name_pattern=...)\` first.
+4. \`direction="outbound"\` misses cross-service callers \u2014 use \`direction="both"\`.
+5. \`search_graph\` results default to 50 per page \u2014 check \`has_more\` and use \`offset\`.
+`;
+
+// src/tools.ts
+var TOOL_SECTION = /^#{1,6}\s+.*\bMCP Tools\b/u;
+var BACKTICKED = /`([a-z][a-z0-9_]*)`/gu;
+function referencedTools(skill = SKILL_default) {
+  const lines = skill.split(`
+`);
+  const opening = lines.findIndex((line) => TOOL_SECTION.test(line));
+  if (opening === -1)
+    return null;
+  const names = new Set;
+  for (const line of lines.slice(opening + 1)) {
+    const text = line.trim();
+    if (text === "") {
+      if (names.size > 0)
+        break;
+      continue;
+    }
+    if (text.startsWith("#"))
+      break;
+    for (const match of text.matchAll(BACKTICKED)) {
+      if (match[1] !== undefined)
+        names.add(match[1]);
+    }
+  }
+  return names.size === 0 ? null : [...names];
+}
+function driftedTools(available, skill = SKILL_default) {
+  const referenced = referencedTools(skill);
+  if (referenced === null)
+    return null;
+  const present = new Set(available);
+  return referenced.filter((name) => !present.has(name));
+}
+async function checkToolSurface(client, version, options = {}) {
+  const debug = options.onDebug ?? (() => {});
+  const available = await client.toolNames();
+  if (available === null) {
+    debug("tool-surface check: the executable's tool list could not be obtained");
+    return null;
+  }
+  const missing = driftedTools(available);
+  if (missing === null) {
+    debug("tool-surface check: the shipped skill no longer carries a readable tool enumeration");
+    return null;
+  }
+  if (missing.length === 0)
+    return null;
+  return `${version} no longer exposes ${missing.join(", ")}, which this package's shipped guidance still names. ` + "Update omp-codebase-memory, or expect the graph instructions to reference tools that are not there.";
+}
+
 // src/lifecycle.ts
 import { rm as rm4 } from "fs/promises";
 
 // src/acquire.ts
-import { chmod, lstat, mkdtemp, mkdir, rename, rm } from "fs/promises";
+import { chmod as chmod2, lstat, mkdtemp, mkdir as mkdir2, rename as rename2, rm as rm2 } from "fs/promises";
 import { tmpdir } from "os";
-import path2 from "path";
-
-// src/exec.ts
-var DEFAULT_TIMEOUT_MS2 = 30000;
-var OUTPUT_LIMIT_BYTES = 262144;
-function capture(stream, onOverflow) {
-  if (stream === undefined) {
-    return { captured: Promise.resolve({ text: "", overflowed: false }), release: () => {} };
-  }
-  const reader = stream.getReader();
-  const drain = async () => {
-    const chunks = [];
-    let total = 0;
-    let overflowed = false;
-    try {
-      for (;; ) {
-        const { done, value } = await reader.read();
-        if (done)
-          break;
-        const room = OUTPUT_LIMIT_BYTES - total;
-        if (value.byteLength > room) {
-          chunks.push(value.subarray(0, room));
-          total = OUTPUT_LIMIT_BYTES;
-          overflowed = true;
-          onOverflow();
-          break;
-        }
-        chunks.push(value);
-        total += value.byteLength;
-      }
-    } finally {
-      await reader.cancel().catch(() => {});
-    }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return { text: new TextDecoder().decode(bytes), overflowed };
-  };
-  return {
-    captured: drain(),
-    release: () => {
-      reader.cancel().catch(() => {});
-    }
-  };
-}
-async function deadlineWon(work, deadline) {
-  if (deadline.aborted)
-    return true;
-  const expired = new Promise((resolve) => {
-    deadline.addEventListener("abort", () => resolve(true), { once: true });
-  });
-  return await Promise.race([work.then(() => false), expired]);
-}
-async function run(argv, options = {}) {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS2;
-  const name = argv[0] ?? "the process";
-  try {
-    const deadline = AbortSignal.timeout(timeoutMs);
-    const child = Bun.spawn([...argv], {
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      signal: deadline,
-      detached: true,
-      ...options.cwd === undefined ? {} : { cwd: options.cwd }
-    });
-    const reap = (signal) => {
-      try {
-        process.kill(-child.pid, signal);
-      } catch {}
-      child.kill(signal);
-    };
-    const stopFlood = () => {
-      reap("SIGTERM");
-    };
-    const stdout = capture(child.stdout, stopFlood);
-    const stderr = capture(child.stderr, stopFlood);
-    const drained = Promise.all([stdout.captured, stderr.captured]);
-    const overran = await deadlineWon(Promise.all([drained, child.exited]), deadline);
-    if (overran) {
-      reap("SIGKILL");
-      stdout.release();
-      stderr.release();
-    }
-    const [out, err] = await drained;
-    const exitCode = await child.exited;
-    if (overran) {
-      return {
-        ok: false,
-        exitCode,
-        stdout: out.text,
-        stderr: err.text,
-        spawnError: `${name} did not finish within ${timeoutMs}ms and was killed`
-      };
-    }
-    if (out.overflowed || err.overflowed) {
-      const flooded = out.overflowed ? "stdout" : "stderr";
-      return {
-        ok: false,
-        exitCode,
-        stdout: out.text,
-        stderr: err.text,
-        spawnError: `${name} wrote more than ${OUTPUT_LIMIT_BYTES} bytes to ${flooded} and was killed`
-      };
-    }
-    return { ok: exitCode === 0, exitCode, stdout: out.text, stderr: err.text };
-  } catch (error) {
-    return {
-      ok: false,
-      exitCode: -1,
-      stdout: "",
-      stderr: "",
-      spawnError: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-async function readVersion(executable) {
-  const result = await run([executable, "--version"], { timeoutMs: 1e4 });
-  if (!result.ok)
-    return null;
-  const reported = `${result.stdout}${result.stderr}`.trim();
-  return reported === "" ? null : reported.split(`
-`)[0]?.trim() ?? null;
-}
-function haveTool(tool, pathEnv) {
-  return Bun.which(tool, pathEnv === undefined ? {} : { PATH: pathEnv }) !== null;
-}
-
-// src/acquire.ts
+import path5 from "path";
 var VERSION_PATTERN = /^[0-9][0-9A-Za-z.+-]*$/u;
 function normalizeVersion(value) {
   const trimmed = value.trim().replace(/^v/iu, "");
@@ -424,26 +950,26 @@ async function acquire(request) {
   if (actual !== expected) {
     throw new Error(`SHA-256 mismatch for ${target.archive} at ${tag}: published ${expected}, downloaded ${actual}`);
   }
-  const scratch = await mkdtemp(path2.join(tmpdir(), "omp-codebase-memory-"));
+  const scratch = await mkdtemp(path5.join(tmpdir(), "omp-codebase-memory-"));
   try {
-    const archive = path2.join(scratch, target.archive);
+    const archive = path5.join(scratch, target.archive);
     await Bun.write(archive, bytes);
     await assertArchiveMembers(archive, target);
     await extract(archive, scratch, target);
-    const candidate = path2.join(scratch, target.executable);
-    await chmod(candidate, 493);
+    const candidate = path5.join(scratch, target.executable);
+    await chmod2(candidate, 493);
     if (target.os === "darwin")
       await repairMacOsSignature(host, candidate);
     const reportedVersion = await smokeCheck(candidate, target);
     return await adopt(host, { version, digest: expected, candidate, reportedVersion });
   } finally {
-    await rm(scratch, { recursive: true, force: true }).catch(() => {});
+    await rm2(scratch, { recursive: true, force: true }).catch(() => {});
   }
 }
 async function assertArchiveMembers(archive, target) {
   const listed = await run(["tar", "-tzf", archive]);
   if (!listed.ok) {
-    throw new Error(`could not enumerate ${path2.basename(archive)}: ${listed.stderr.trim() || listed.spawnError || `tar exited ${listed.exitCode}`}`);
+    throw new Error(`could not enumerate ${path5.basename(archive)}: ${listed.stderr.trim() || listed.spawnError || `tar exited ${listed.exitCode}`}`);
   }
   const records = listed.stdout.split(`
 `);
@@ -467,10 +993,10 @@ async function assertArchiveMembers(archive, target) {
 async function extract(archive, into, target) {
   const extracted = await run(["tar", "--no-same-owner", "-xzf", archive, "-C", into]);
   if (!extracted.ok) {
-    throw new Error(`could not extract ${path2.basename(archive)}: ${extracted.stderr.trim() || extracted.spawnError || `tar exited ${extracted.exitCode}`}`);
+    throw new Error(`could not extract ${path5.basename(archive)}: ${extracted.stderr.trim() || extracted.spawnError || `tar exited ${extracted.exitCode}`}`);
   }
   for (const member of target.members) {
-    const entry = path2.join(into, member);
+    const entry = path5.join(into, member);
     let stats;
     try {
       stats = await lstat(entry);
@@ -512,19 +1038,19 @@ async function smokeCheck(candidate, target) {
 }
 async function adopt(host, candidate) {
   const binRoot = managedBinRoot(host);
-  const destination = path2.join(binRoot, candidate.version);
-  const name = path2.basename(candidate.candidate);
-  const executable = path2.join(destination, name);
-  await mkdir(binRoot, { recursive: true });
-  const staging = await mkdtemp(path2.join(binRoot, ".staging-"));
+  const destination = path5.join(binRoot, candidate.version);
+  const name = path5.basename(candidate.candidate);
+  const executable = path5.join(destination, name);
+  await mkdir2(binRoot, { recursive: true });
+  const staging = await mkdtemp(path5.join(binRoot, ".staging-"));
   try {
-    const staged = path2.join(staging, name);
+    const staged = path5.join(staging, name);
     await Bun.write(staged, Bun.file(candidate.candidate));
-    await chmod(staged, 493);
-    await mkdir(destination, { recursive: true });
-    await rename(staged, executable);
+    await chmod2(staged, 493);
+    await mkdir2(destination, { recursive: true });
+    await rename2(staged, executable);
   } finally {
-    await rm(staging, { recursive: true, force: true }).catch(() => {});
+    await rm2(staging, { recursive: true, force: true }).catch(() => {});
   }
   return {
     version: candidate.version,
@@ -535,9 +1061,9 @@ async function adopt(host, candidate) {
 }
 
 // src/mcp-config.ts
-import { randomUUID } from "crypto";
-import { chmod as chmod2, mkdir as mkdir2, rename as rename2, rm as rm2, stat } from "fs/promises";
-import path3 from "path";
+import { randomUUID as randomUUID2 } from "crypto";
+import { chmod as chmod3, mkdir as mkdir3, rename as rename3, rm as rm3, stat as stat2 } from "fs/promises";
+import path6 from "path";
 var MCP_SCHEMA_URL = "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json";
 async function readMcpFile(host) {
   const file = mcpConfigPath(host);
@@ -618,7 +1144,7 @@ async function upsertEntry(host, command, previouslyWrote) {
     args: []
   };
   next["mcpServers"] = { ...servers, [SERVER_NAME]: entry };
-  await mkdir2(path3.dirname(file.path), { recursive: true });
+  await mkdir3(path6.dirname(file.path), { recursive: true });
   await writeDurably(file.path, render(next, file));
   return { ok: true, change: file.text === null ? "created" : "updated" };
 }
@@ -646,7 +1172,7 @@ async function removeEntry(host, wroteCommand) {
   const others = Object.keys(file.document).filter((key) => key !== "mcpServers");
   const ourCreation = others.length === 1 && others[0] === "$schema" && file.document["$schema"] === MCP_SCHEMA_URL;
   if (Object.keys(remaining).length === 0 && ourCreation) {
-    await rm2(file.path, { force: true });
+    await rm3(file.path, { force: true });
     return { ok: true, change: "removed" };
   }
   const next = { ...file.document, mcpServers: remaining };
@@ -697,62 +1223,6 @@ function render(document, file) {
 ` : body;
 }
 async function writeDurably(file, contents) {
-  const staging = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    let mode = 384;
-    try {
-      mode = (await stat(file)).mode & 511;
-    } catch (error) {
-      const code = error?.code;
-      if (code !== "ENOENT")
-        throw error;
-    }
-    await Bun.write(staging, contents);
-    await chmod2(staging, mode);
-    await rename2(staging, file);
-  } catch (error) {
-    await rm2(staging, { force: true });
-    throw error;
-  }
-}
-
-// src/state.ts
-import { randomUUID as randomUUID2 } from "crypto";
-import { chmod as chmod3, mkdir as mkdir3, rename as rename3, rm as rm3, stat as stat2 } from "fs/promises";
-import path4 from "path";
-var EMPTY = {};
-async function readState(host) {
-  const file = Bun.file(statePath(host));
-  let text;
-  try {
-    text = await file.text();
-  } catch {
-    return EMPTY;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return EMPTY;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-    return EMPTY;
-  const record = parsed;
-  const state = {};
-  for (const key of ["managedVersion", "managedDigest", "pin", "upstreamVersion", "wroteCommand"]) {
-    const value = record[key];
-    if (typeof value === "string" && value !== "")
-      state[key] = value;
-  }
-  const lastCheckedAt = record["lastCheckedAt"];
-  if (typeof lastCheckedAt === "number" && Number.isFinite(lastCheckedAt)) {
-    state["lastCheckedAt"] = lastCheckedAt;
-  }
-  return state;
-}
-async function writeState(host, next) {
-  const file = statePath(host);
-  await mkdir3(path4.dirname(file), { recursive: true });
   const staging = `${file}.${process.pid}.${randomUUID2()}.tmp`;
   try {
     let mode = 384;
@@ -763,8 +1233,7 @@ async function writeState(host, next) {
       if (code !== "ENOENT")
         throw error;
     }
-    await Bun.write(staging, `${JSON.stringify(next, null, 2)}
-`);
+    await Bun.write(staging, contents);
     await chmod3(staging, mode);
     await rename3(staging, file);
   } catch (error) {
@@ -772,68 +1241,10 @@ async function writeState(host, next) {
     throw error;
   }
 }
-async function updateState(host, patch) {
-  const next = { ...await readState(host), ...patch };
-  await writeState(host, next);
-  return next;
-}
-
-// src/resolve.ts
-import path5 from "path";
-var NO_EXECUTABLE_REASON = `no ${EXECUTABLE_NAME} executable found on PATH, in ~/.local/bin, or under this package's own root. ` + "Run /cbm install to download a managed copy, or install it yourself with " + "`curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash` " + "and this package will adopt it.";
-async function managedCopy(host, state) {
-  const recorded = (state ?? await readState(host)).managedVersion;
-  if (recorded === undefined)
-    return null;
-  const executable = managedExecutable(host, recorded);
-  return await Bun.file(executable).exists() ? { version: recorded, executable } : null;
-}
-async function resolveExecutable(host, state) {
-  const current = state ?? await readState(host);
-  const pin = current.pin;
-  if (pin !== undefined) {
-    const pinned = managedExecutable(host, pin);
-    if (await Bun.file(pinned).exists()) {
-      return { ok: true, resolved: { executable: pinned, source: "pin", origin: pin } };
-    }
-  }
-  const onPath = Bun.which(EXECUTABLE_NAME, pathOption(host));
-  if (onPath !== null) {
-    return {
-      ok: true,
-      resolved: { executable: path5.resolve(onPath), source: "system", origin: "PATH" }
-    };
-  }
-  const upstream = path5.join(upstreamInstallDir(host), EXECUTABLE_NAME);
-  if (await Bun.file(upstream).exists()) {
-    return {
-      ok: true,
-      resolved: { executable: upstream, source: "system", origin: "~/.local/bin" }
-    };
-  }
-  const managed = await managedCopy(host, current);
-  if (managed !== null) {
-    return {
-      ok: true,
-      resolved: {
-        executable: managed.executable,
-        source: "managed",
-        origin: path5.join(path5.basename(managedBinRoot(host)), managed.version)
-      }
-    };
-  }
-  return { ok: false, reason: NO_EXECUTABLE_REASON };
-}
-async function resolvedVersion(resolved) {
-  return await readVersion(resolved.executable);
-}
-function pathOption(host) {
-  return { PATH: host.env["PATH"] ?? "" };
-}
 
 // src/lifecycle.ts
 var CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-async function status(lifecycle) {
+async function status(lifecycle, index) {
   const { host } = lifecycle;
   const state = await readState(host);
   const resolution = await resolveExecutable(host, state);
@@ -859,6 +1270,23 @@ async function status(lifecycle) {
     lines.push(`mcp entry:  absent from ${entry.path}`);
   } else {
     lines.push(`mcp entry:  ${entry.current ? "current" : `stale, names ${entry.command ?? "(no command)"}`} in ${entry.path}`);
+  }
+  if (resolved === null) {
+    lines.push("index:      not checked (no executable resolved)");
+  } else {
+    const probed = await index(resolved.executable);
+    switch (probed.kind) {
+      case "project":
+        lines.push(`index:      ${probed.project.name}`);
+        lines.push(`index root: ${probed.project.root}`);
+        break;
+      case "unindexed":
+        lines.push("index:      this directory is not covered by an indexed project");
+        break;
+      case "unavailable":
+        lines.push("index:      unknown (the graph did not answer)");
+        break;
+    }
   }
   return { lines, resolved };
 }
@@ -1094,6 +1522,12 @@ function ompCodebaseMemory(pi) {
   const report = (ctx, outcome) => {
     notify(ctx, `/cbm: ${outcome.message}`, outcome.ok ? "info" : "error");
   };
+  const debug = (message) => {
+    pi.logger.info("omp-codebase-memory: graph", { message });
+  };
+  const checkDebug = (message) => {
+    pi.logger.info("omp-codebase-memory: check", { message });
+  };
   pi.registerCommand("cbm", {
     description: "codebase-memory-mcp lifecycle: status, install, update, pin, unpin, uninstall",
     getArgumentCompletions: (prefix) => {
@@ -1108,7 +1542,7 @@ function ompCodebaseMemory(pi) {
       }
       switch (subcommand) {
         case "status": {
-          const report_ = await status(lifecycle);
+          const report_ = await status(lifecycle, indexProbe(ctx.cwd, debug));
           notify(ctx, ["codebase-memory-mcp", ...report_.lines].join(`
 `), "info");
           return;
@@ -1162,21 +1596,59 @@ function ompCodebaseMemory(pi) {
         error: error instanceof Error ? error.message : String(error)
       });
     }
-    const scheduler = schedulerFrom(ctx);
-    scheduler.after(() => {
-      checkUpstream(active).then((check) => {
-        if (check.kind === "newer")
-          notifyOnce(ctx, `codebase-memory-mcp: ${check.message}`, "info");
-        else
-          pi.logger.info("omp-codebase-memory: version check", { check: check.message });
-      }).catch((error) => {
-        pi.logger.info("omp-codebase-memory: version check failed", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-    }, CHECK_DELAY_MS);
+    deferChecks(active, schedulerFrom(ctx), {
+      notify: (message, type) => notifyOnce(ctx, `codebase-memory-mcp: ${message}`, type),
+      debug: checkDebug
+    });
   });
 }
+function indexProbe(cwd, onDebug) {
+  return async (executable) => {
+    const client = openGraphClient(executable, {
+      queryTimeoutMs: COMMAND_TIMEOUT_MS,
+      totalTimeoutMs: COMMAND_TIMEOUT_MS,
+      onDebug
+    });
+    try {
+      if (await client.toolNames() === null)
+        return { kind: "unavailable" };
+      return await projectResolver(client, cwd).resolve();
+    } finally {
+      client.close();
+    }
+  };
+}
+function deferChecks(active, scheduler, sinks) {
+  scheduler.after(() => {
+    checkUpstream(active).then((check) => {
+      if (check.kind === "newer")
+        sinks.notify(check.message, "info");
+      else
+        sinks.debug(`version check: ${check.message}`);
+    }).catch((error) => {
+      sinks.debug(`version check failed: ${error instanceof Error ? error.message : String(error)}`);
+    }).then(async () => await driftCheck(active, sinks)).catch((error) => {
+      sinks.debug(`tool-surface check failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, CHECK_DELAY_MS);
+}
+async function driftCheck(active, sinks) {
+  const resolution = await resolveExecutable(active.host, await readState(active.host));
+  if (!resolution.ok)
+    return;
+  const version = await resolvedVersion(resolution.resolved) ?? resolution.resolved.executable;
+  const client = openGraphClient(resolution.resolved.executable, { onDebug: sinks.debug });
+  try {
+    const notice = await checkToolSurface(client, version, { onDebug: sinks.debug });
+    if (notice !== null)
+      sinks.notify(notice, "warning");
+  } finally {
+    client.close();
+  }
+}
 export {
-  ompCodebaseMemory as default
+  indexProbe,
+  deferChecks,
+  ompCodebaseMemory as default,
+  CHECK_DELAY_MS
 };

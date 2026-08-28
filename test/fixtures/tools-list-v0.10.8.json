@@ -1,0 +1,53 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "index_repository"
+      },
+      {
+        "name": "search_graph"
+      },
+      {
+        "name": "query_graph"
+      },
+      {
+        "name": "trace_path"
+      },
+      {
+        "name": "get_code_snippet"
+      },
+      {
+        "name": "get_graph_schema"
+      },
+      {
+        "name": "get_architecture"
+      },
+      {
+        "name": "search_code"
+      },
+      {
+        "name": "list_projects"
+      },
+      {
+        "name": "delete_project"
+      },
+      {
+        "name": "index_status"
+      },
+      {
+        "name": "check_index_coverage"
+      },
+      {
+        "name": "detect_changes"
+      },
+      {
+        "name": "manage_adr"
+      },
+      {
+        "name": "ingest_traces"
+      }
+    ]
+  }
+}

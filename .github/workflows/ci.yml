@@ -5,11 +5,29 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # The `harvest` job's whole purpose is detecting that upstream shipped
+  # different content, and that event produces no activity in this repository at
+  # all -- so a gate firing only on push cannot detect a new upstream release,
+  # which is the one case the drift requirement exists for. Weekly, off the hour.
+  #
+  # Known blind spot, and it cannot be closed from inside the repository: GitHub
+  # disables scheduled workflows after prolonged repository inactivity, silently.
+  # That is why the per-session tool-surface check on the operator's own machine
+  # is the primary detector and this is the secondary net; see README.md.
+  schedule:
+    - cron: "17 4 * * 1"
   # Reused by `release.yml`, so a tag passes the same gate a pull request does
   # rather than a copy of it that can drift.
   workflow_call:
 
 # Least privilege: nothing in this workflow writes to the repository.
+#
+# The scheduled `harvest` run inherits this and needs nothing more. Its failure
+# *is* the notification -- GitHub already delivers it -- so it opens no pull
+# request, pushes no branch, commits no regenerated artifact, and creates no
+# issue. Regenerating stays a reviewed human commit: buying that convenience
+# would cost write scopes on both contents and pull requests, and would make the
+# least-privilege posture depend on an automation nobody reviews per run.
 permissions:
   contents: read
 
@@ -187,21 +205,123 @@ jobs:
         timeout-minutes: 5
         run: bun run test:packaging
 
-      # `test:packaging` rebuilds `dist/index.js` before loading it, so a green
-      # packaging step proves that a fresh bundle builds and registers what it
-      # claims -- never that the committed one matches the source beside it. The
-      # README tells an operator to load the committed file directly after
-      # `git clone` with no build step, so without this a pull request carrying
-      # an innocuous source diff and a substituted bundle would merge green.
-      - name: Verify the committed bundle matches the one built from source
+      # `test:packaging` rebuilds both bundles before loading them, so a green
+      # packaging step proves a fresh bundle builds and registers what it claims
+      # -- never that the committed one matches the source beside it. The README
+      # tells an operator to load the committed files directly after `git clone`
+      # with no build step, so without this a pull request carrying an innocuous
+      # source diff and a substituted bundle would merge green.
+      - name: Verify the committed bundles match the ones built from source
         timeout-minutes: 5
         run: |
           set -euo pipefail
 
-          # A pathspec matching nothing makes `git diff` exit 0, so the path is
+          # Read out of the manifest rather than listed again here: the entries
+          # OMP loads are the ones that have to match, and a second list drifts.
+          # The feature entry is included, so declining the feature at install
+          # time cannot make an unverified bundle ship.
+          mapfile -t bundles < <(
+            jq -r '(.omp.extensions // []) + ([.omp.features // {} | .[].extensions // []] | add // [])
+                   | .[] | sub("^\\./"; "")' package.json | sort -u
+          )
+
+          if [ "${#bundles[@]}" -eq 0 ]; then
+            echo "::error::package.json declares no extension entries; this check would verify nothing"
+            exit 1
+          fi
+
+          printf 'checking %d bundle(s)\n' "${#bundles[@]}"
+          printf '  %s\n' "${bundles[@]}"
+
+          # A pathspec matching nothing makes `git diff` exit 0, so every path is
           # confirmed tracked before its diff is trusted.
-          git ls-files --error-unmatch dist/index.js
-          git diff --exit-code -- dist/index.js
+          for bundle in "${bundles[@]}"; do
+            git ls-files --error-unmatch "$bundle"
+          done
+          git diff --exit-code -- "${bundles[@]}"
+
+  # Runtime job. Regenerates the shipped skill, rule, and agents from a real CBM
+  # executable and fails when the committed copies differ. The source of truth is
+  # embedded in the executable and changes with it, so a copy nobody regenerates
+  # becomes a second, silently diverging statement of the same contract.
+  #
+  # Also the secondary drift detector, which is why the workflow carries a
+  # `schedule` trigger: see the comment on `on:` for what a push-only gate cannot
+  # see, and README.md for why the per-session check is the primary one.
+  harvest:
+    name: harvest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Bun toolchain
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        timeout-minutes: 5
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: bun install --frozen-lockfile
+
+      - name: Acquire the newest CBM release through this package's own path
+        timeout-minutes: 15
+        # Not `curl … install.sh | bash`: that is an unpinned script run with the
+        # runner's privileges. This goes through `src/acquire.ts`, which verifies
+        # the asset against the release's own `checksums.txt`, refuses an archive
+        # whose member list is not exactly the expected four, and runs the
+        # candidate once before adopting it.
+        run: bun run scripts/acquire-cbm.ts
+
+      - name: Regenerate the shipped context artifacts
+        timeout-minutes: 10
+        # `--stop-sessions` is a no-op here and load-bearing on a contributor's
+        # machine: `install` is CBM's activation path and drains active CBM
+        # sessions first, so the harvest refuses by default rather than closing
+        # an editor's MCP connection as a side effect of regenerating docs. A
+        # runner has no sessions to close.
+        run: bun run harvest --stop-sessions
+
+      - name: Fail when a committed generated artifact differs
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # From the provenance record the pipeline just wrote, so the list is
+          # the pipeline's own and cannot fall behind it.
+          mapfile -t generated < <(jq -r '.generated[]' harvest.json | sort -u)
+
+          if [ "${#generated[@]}" -eq 0 ]; then
+            echo "::error::harvest.json names no generated paths; this check would verify nothing"
+            exit 1
+          fi
+
+          printf 'checking %d generated path(s)\n' "${#generated[@]}"
+          printf '  %s\n' "${generated[@]}"
+
+          for file in "${generated[@]}"; do
+            git ls-files --error-unmatch "$file"
+          done
+
+          if ! git diff --exit-code -- "${generated[@]}"; then
+            echo "::error::the committed context artifacts differ from what this CBM release emits; run \`bun run harvest\` and commit the result"
+            exit 1
+          fi
+
+          # A path the pipeline stopped writing, or one it started writing, is
+          # drift the diff above cannot see: the first is not in the new list and
+          # the second is not yet tracked.
+          strays="$(git status --porcelain --untracked-files=all -- skills rules agents harvest.json)"
+          if [ -n "$strays" ]; then
+            echo "::error::the owned directories hold changes outside the regenerated set:"
+            echo "$strays"
+            exit 1
+          fi
 
   # Runtime job. Runs the two install commands the README documents, through
   # OMP's own CLI, so the documented path and the verified path are one path.
@@ -218,6 +338,10 @@ jobs:
   # release, so the documented command is verified against the exact ref an
   # operator can install. It is deliberately absent from `ci`'s `needs`: a
   # skipped job would otherwise fail the required check on every pull request.
+  #
+  # `schedule` is deliberately absent from the condition too. A scheduled run
+  # exists to re-run the drift gate, it reports no pull-request check, and
+  # installing by ref on a timer would verify the same ref again for nothing.
   install-check:
     name: install check
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
@@ -292,6 +416,28 @@ jobs:
           cat "$HOME/plugins.txt"
           grep -q 'omp-codebase-memory' "$HOME/plugins.txt"
 
+          # A packaging change can drop a whole directory without changing a
+          # single file in it, so the shipped context surfaces are asserted on
+          # the *installed* tree rather than on the working tree the suite reads.
+          # The root comes from OMP's own registry, not from a path guessed here.
+          root="$(omp plugin list --json | jq -r '.npm[] | select(.name == "omp-codebase-memory") | .path')"
+          if [ -z "$root" ] || [ ! -d "$root" ]; then
+            echo "::error::omp plugin list --json reported no installed path for omp-codebase-memory"
+            exit 1
+          fi
+          echo "installed at $root"
+
+          missing=0
+          while read -r file; do
+            if [ -f "$root/$file" ]; then
+              echo "  ok   $file"
+            else
+              echo "::error::the installed tree is missing $file"
+              missing=$((missing + 1))
+            fi
+          done <<< "$(jq -r '.generated[]' harvest.json)"
+          [ "$missing" -eq 0 ]
+
       - name: Link this checkout the way the development install documents
         timeout-minutes: 5
         run: |
@@ -317,7 +463,7 @@ jobs:
   # means editing this job's `needs` and nothing else.
   ci:
     name: ci
-    needs: [hygiene, bun]
+    needs: [hygiene, bun, harvest]
     # `always()` is load-bearing. Without it this job is skipped when a
     # dependency fails, and a skipped required check blocks a pull request
     # rather than failing it -- a stuck merge button instead of a red one.

@@ -5,6 +5,7 @@ import { agentDir, insideManagedBinRoot, packageRoot, type Host } from "./paths.
 import { entryStatus, removeEntry, upsertEntry } from "./mcp-config.ts";
 import { resolvedVersion, managedCopy, resolveExecutable, type Resolved } from "./resolve.ts";
 import { readState, updateState, writeState, type State } from "./state.ts";
+import type { ProjectResolution } from "./project.ts";
 import type { ReleaseSource } from "./release.ts";
 import type { Target } from "./platform.ts";
 
@@ -40,6 +41,22 @@ export interface StatusReport {
   readonly resolved: Resolved | null;
 }
 
+/**
+ * How status learns whether an indexed project covers the working directory.
+ *
+ * A seam rather than a direct graph call, because asking costs a CBM process
+ * and the caller is the only thing that knows how to open and close one. It is
+ * consulted only when an executable resolved: there is no project to name when
+ * there is nothing to ask.
+ *
+ * The caller is expected to answer through `projectResolver`, so status and the
+ * augmentation make the same selection over the same `list_projects` answer.
+ * The two resolutions are independent -- the augmentation is a separate feature
+ * entry that may not be loaded at all -- so what they share is the rule, not
+ * the result.
+ */
+export type IndexProbe = (executable: string) => Promise<ProjectResolution>;
+
 /** The outcome of one lifecycle action, ready to show an operator. */
 export interface ActionReport {
   readonly ok: boolean;
@@ -64,8 +81,18 @@ export interface CheckReport {
  * A managed copy is reported even when it is not the resolved one, because
  * "system wins over managed" is a policy whose consequences should never be
  * invisible: an operator with both should be able to see both.
+ *
+ * Index state is reported for the same reason. A report naming a resolved
+ * executable and a current MCP entry over an empty graph describes an
+ * installation that answers nothing, and index state is the field that makes
+ * the report correspond to what the operator can actually do. An unindexed
+ * directory is stated plainly rather than as an error: nothing in this package
+ * indexes a repository, and the shipped skill and rule already tell the model to
+ * confirm the project with `list_projects` or `index_status` -- indexing is a
+ * tool in that same surface, so the agent is the actor and a second path here
+ * would duplicate it.
  */
-export async function status(lifecycle: Lifecycle): Promise<StatusReport> {
+export async function status(lifecycle: Lifecycle, index: IndexProbe): Promise<StatusReport> {
   const { host } = lifecycle;
   const state = await readState(host);
   const resolution = await resolveExecutable(host, state);
@@ -102,6 +129,24 @@ export async function status(lifecycle: Lifecycle): Promise<StatusReport> {
     lines.push(
       `mcp entry:  ${entry.current ? "current" : `stale, names ${entry.command ?? "(no command)"}`} in ${entry.path}`,
     );
+  }
+
+  if (resolved === null) {
+    lines.push("index:      not checked (no executable resolved)");
+  } else {
+    const probed = await index(resolved.executable);
+    switch (probed.kind) {
+      case "project":
+        lines.push(`index:      ${probed.project.name}`);
+        lines.push(`index root: ${probed.project.root}`);
+        break;
+      case "unindexed":
+        lines.push("index:      this directory is not covered by an indexed project");
+        break;
+      case "unavailable":
+        lines.push("index:      unknown (the graph did not answer)");
+        break;
+    }
   }
 
   return { lines, resolved };
