@@ -41,15 +41,23 @@ landed this way: `feat/graph-context-and-agents`,
 The default branch and release tags are protected by the rulesets committed
 under `.github/rulesets/`. This paragraph and the list below it state two things
 and no more. First, the shape of that protection: the facts whose change would
-change how work lands here — what a contributor must do, which button merges,
-whether a branch must be current first. Second, the two literals another file in
-this repository must match: the required check name `ci`, which is the gate
-job's own name in `ci.yml`, and the tag pattern `v*`, which a pushed tag and
-`.omp-plugin/marketplace.json`'s `source.ref` must satisfy. Nothing verifies
-either agreement mechanically, which is why those two are stated here at all.
-Everything that can move without changing the procedure stays in the rulesets —
-approval counts, the actor and bypass lists, the exemptions — so read a value
-there rather than trusting one repeated in prose. The shape:
+change the sequence of steps by which work lands here — what a contributor must
+do, which button merges, whether a branch must be current first. Second, the two
+literals a ruleset shares with a workflow: the required check name `ci`, which
+`main.json` requires and which is the gate job's own name in `ci.yml`, and the
+tag pattern `v*`, which `tags.json` protects and which `release.yml` triggers
+on. Nothing reads either ruleset file, so neither agreement is checked anywhere;
+that is why those two are stated here at all. (The third pairing, between a
+pushed tag and `.omp-plugin/marketplace.json`'s `source.ref`, is checked — the
+release version gate fails on a mismatch — so it lives in `CONTRIBUTING.md`
+with the procedure, not here.)
+
+A value that only tunes a threshold inside a step that stays the same is a
+parameter and stays in the rulesets: the actor and bypass lists, the
+review-dismissal and code-owner switches, the exemptions. Read those there
+rather than trusting a value repeated in prose. The approval count is zero
+today, so there is no approval step to describe; were it to change, the list
+below would gain one. The shape:
 
 - The default branch rejects deletion and non-fast-forward pushes.
 - Landing a change requires a pull request whose review threads are resolved.
