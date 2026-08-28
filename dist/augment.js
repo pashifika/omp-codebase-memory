@@ -66,16 +66,32 @@ function projectResolver(client, cwd) {
 
 // src/augment.ts
 var SYMBOL_LIMIT = 12;
+var CANDIDATE_LIMIT = 50;
 var COVERAGE_LIMIT = 8;
 var APPEND_LIMIT_BYTES = 4096;
+var FRAME_LIMIT_BYTES = 512;
+var ENCODER = new TextEncoder;
+var CUT_MARK = "\u2026";
+var CUT_MARK_BYTES = ENCODER.encode(CUT_MARK).length;
 var IDENTIFIER = /[A-Za-z_][A-Za-z0-9_]{2,}/gu;
 var QUERY_TOKEN_LIMIT = 4;
-var CONTAINER_LABELS = new Set(["File", "Folder", "Module"]);
+var DEFINITION_LABELS = {
+  Class: true,
+  Enum: true,
+  Function: true,
+  Interface: true,
+  Method: true,
+  Struct: true,
+  Trait: true,
+  Type: true,
+  Variable: true
+};
 var CLEAN_COVERAGE = "no_recorded_issue";
 var COVERAGE_CAVEAT = "A clean coverage result means no recorded gap, not proof of completeness.";
 function createAugmenter(deps) {
   let opened = null;
   let client = null;
+  let closed = false;
   const notified = new Set;
   const notifyOnce = (message) => {
     if (notified.has(message))
@@ -85,11 +101,20 @@ function createAugmenter(deps) {
   };
   const session = async () => {
     opened ??= (async () => {
-      const opening = await deps.openClient();
-      if (opening === null)
+      try {
+        const opening = await deps.openClient();
+        if (opening === null)
+          return null;
+        if (closed) {
+          opening.close();
+          return null;
+        }
+        client = opening;
+        return { client: opening, resolver: projectResolver(opening, deps.cwd) };
+      } catch (error) {
+        deps.debug(`opening the graph session failed: ${error instanceof Error ? error.message : String(error)}`);
         return null;
-      client = opening;
-      return { client: opening, resolver: projectResolver(opening, deps.cwd) };
+      }
     })();
     return await opened;
   };
@@ -114,7 +139,7 @@ function createAugmenter(deps) {
         if (appended === null)
           return;
         return {
-          content: [...event.content, { type: "text", text: appended.slice(0, APPEND_LIMIT_BYTES) }]
+          content: [...event.content, { type: "text", text: appended }]
         };
       } catch (error) {
         deps.debug(`augmentation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -135,19 +160,20 @@ function createAugmenter(deps) {
       }
     },
     close() {
+      closed = true;
       client?.close();
       client = null;
     }
   };
 }
 async function symbolsFor(client, project, tool, input) {
-  const selector = tool === "grep" ? namePatternFrom(input["pattern"]) : filePatternFrom(input["path"]);
+  const selector = selectorFor(tool, input);
   if (selector === null)
     return null;
   const structured = await client.call("search_graph", {
     project,
     ...selector,
-    limit: SYMBOL_LIMIT,
+    limit: CANDIDATE_LIMIT,
     format: "json"
   });
   const rows = readRows(structured);
@@ -156,12 +182,35 @@ async function symbolsFor(client, project, tool, input) {
   const ranked = [...rows].sort((left, right) => right.inDegree - left.inDegree).slice(0, SYMBOL_LIMIT);
   const lines = ranked.map((row) => `- ${row.qualified} (${row.label}) ${row.file}${row.lines}${degreeOf(row)}`);
   const carriesDegree = ranked.some((row) => row.inDegree >= 0);
-  return [
-    `Codebase graph \u2014 ${lines.length} symbol(s) matching this ${tool} in project ${project}:`,
-    ...lines,
-    carriesDegree ? "in/out is selected graph degree, not a caller count; use trace_path for callers or get_code_snippet for source." : "Use trace_path for callers or get_code_snippet for exact source."
-  ].join(`
-`);
+  return block((listed) => symbolHeading(tool, project, listed, rows.length, structured), lines, carriesDegree ? "in/out is selected graph degree, not a caller count; use trace_path for callers or get_code_snippet for source." : "Use trace_path for callers or get_code_snippet for exact source.");
+}
+function selectorFor(tool, input) {
+  const scope = filePatternFrom(input["path"]);
+  if (tool === "glob")
+    return scope;
+  const named = namePatternFrom(input["pattern"]);
+  if (named === null)
+    return null;
+  return scope === null ? named : { ...named, ...scope };
+}
+function symbolHeading(tool, project, listed, pooled, structured) {
+  const total = totalOf(structured);
+  const paged = hasMore(structured);
+  if (listed >= (total ?? pooled) && !paged) {
+    return `Codebase graph \u2014 ${listed} symbol(s) matching this ${tool} in project ${project}:`;
+  }
+  const matched = total === null ? `${pooled}${paged ? "+" : ""}` : `${total}`;
+  const ranking = paged ? `highest in-degree of the first ${CANDIDATE_LIMIT}` : "highest in-degree first";
+  return `Codebase graph \u2014 ${listed} of ${matched} symbol(s) matching this ${tool} in project ${project}, ${ranking}:`;
+}
+function totalOf(structured) {
+  if (typeof structured !== "object" || structured === null || !("total" in structured))
+    return null;
+  const total = structured.total;
+  return typeof total === "number" && Number.isFinite(total) ? total : null;
+}
+function hasMore(structured) {
+  return typeof structured === "object" && structured !== null && "has_more" in structured && structured.has_more === true;
 }
 function degreeOf(row) {
   return row.inDegree < 0 ? "" : ` \u2014 ${row.inDegree} in / ${row.outDegree} out`;
@@ -206,7 +255,7 @@ function readRows(structured) {
   }
   if ("groups" in structured && Array.isArray(structured.groups)) {
     for (const group of structured.groups) {
-      if (rows.length >= SYMBOL_LIMIT)
+      if (rows.length >= CANDIDATE_LIMIT)
         break;
       if (typeof group !== "object" || group === null || !("rows" in group))
         continue;
@@ -222,7 +271,7 @@ function readRows(structured) {
 }
 function collect(out, rows, columns, prefix, groupFile) {
   for (const row of rows) {
-    if (out.length >= SYMBOL_LIMIT)
+    if (out.length >= CANDIDATE_LIMIT)
       return;
     if (!Array.isArray(row))
       continue;
@@ -243,7 +292,7 @@ function collect(out, rows, columns, prefix, groupFile) {
     if (qualified === "" || qualified.endsWith("__file__"))
       continue;
     const label = cell(columns.label) === "" ? "symbol" : cell(columns.label);
-    if (CONTAINER_LABELS.has(label))
+    if (columns.label >= 0 && DEFINITION_LABELS[label] !== true)
       continue;
     const lines = cell(columns.lines);
     out.push({
@@ -278,11 +327,12 @@ async function coverageFor(client, project, root, input, cwd) {
     const status = entry.status;
     if (typeof status !== "string" || status === CLEAN_COVERAGE)
       continue;
+    const recorded = "coverage" in entry && Array.isArray(entry.coverage) ? entry.coverage : [];
+    const gaps = recorded.slice(0, COVERAGE_LIMIT);
     const action = "recommended_action" in entry && typeof entry.recommended_action === "string" ? entry.recommended_action : "";
-    findings.push(`- ${relative}: ${status}${action === "" ? "" : ` (${action})`}`);
-    if (!("coverage" in entry) || !Array.isArray(entry.coverage))
-      continue;
-    for (const gap of entry.coverage.slice(0, COVERAGE_LIMIT)) {
+    const advise = action !== "" && (gaps.length === 0 || gaps.some(actionable));
+    findings.push(cut(`- ${relative}: ${status}${advise ? ` (${action})` : ""}`, FRAME_LIMIT_BYTES));
+    for (const gap of gaps) {
       if (typeof gap !== "object" || gap === null)
         continue;
       const where = "path" in gap && typeof gap.path === "string" ? gap.path : relative;
@@ -294,8 +344,46 @@ async function coverageFor(client, project, root, input, cwd) {
   if (findings.length === 0)
     return null;
   const caveat = "caveat" in structured && typeof structured.caveat === "string" && structured.caveat !== "" ? structured.caveat : COVERAGE_CAVEAT;
-  return [`Codebase graph coverage for this read (project ${project}):`, ...findings, caveat].join(`
+  return block(() => `Codebase graph coverage for this read (project ${project}):`, findings, caveat);
+}
+function actionable(gap) {
+  if (typeof gap !== "object" || gap === null)
+    return false;
+  if ("kind" in gap && gap.kind === "not_indexed_dir")
+    return false;
+  if ("match" in gap && gap.match === "ancestor")
+    return false;
+  return true;
+}
+function block(heading, rows, note) {
+  const bytes = (line) => ENCODER.encode(line).length + 1;
+  const closing = cut(note, FRAME_LIMIT_BYTES);
+  let reserve = 0;
+  let listed = rows.length;
+  for (;; ) {
+    const framed = cut(heading(listed), FRAME_LIMIT_BYTES);
+    reserve = Math.max(reserve, bytes(framed));
+    let size = reserve + bytes(closing);
+    const kept = [];
+    for (const row of rows) {
+      const cost = bytes(row);
+      if (size + cost > APPEND_LIMIT_BYTES)
+        break;
+      size += cost;
+      kept.push(row);
+    }
+    if (kept.length === listed)
+      return [framed, ...kept, closing].join(`
 `);
+    listed = kept.length;
+  }
+}
+function cut(line, limit) {
+  if (ENCODER.encode(line).length <= limit)
+    return line;
+  const room = new Uint8Array(limit - CUT_MARK_BYTES);
+  const { read } = ENCODER.encodeInto(line, room);
+  return `${line.slice(0, read)}${CUT_MARK}`;
 }
 
 // src/exec.ts
@@ -304,22 +392,38 @@ var OUTPUT_LIMIT_BYTES = 262144;
 // src/graph.ts
 var HANDSHAKE_TIMEOUT_MS = 20000;
 var QUERY_TIMEOUT_MS = 300;
+var REOPEN_LIMIT = 2;
 var PROTOCOL_VERSION = "2024-11-05";
 var EXPIRED = Symbol("deadline");
 function openGraphClient(executable, options = {}) {
   const queryTimeoutMs = options.queryTimeoutMs ?? QUERY_TIMEOUT_MS;
+  const totalTimeoutMs = options.totalTimeoutMs;
   const debug = options.onDebug ?? (() => {});
+  let expiresAt = null;
+  const budgeted = (timeoutMs) => {
+    if (totalTimeoutMs === undefined)
+      return timeoutMs;
+    expiresAt ??= Date.now() + totalTimeoutMs;
+    return Math.max(0, Math.min(timeoutMs, expiresAt - Date.now()));
+  };
   let child = null;
   let handshake = null;
+  let established = false;
+  let declined = false;
+  let opens = 0;
   let closed = false;
   let nextId = 0;
   const pending = new Map;
-  const teardown = (reason) => {
+  const teardown = (reason, owner) => {
+    if (owner !== child)
+      return;
     for (const settle of pending.values())
       settle({ error: { message: reason } });
     pending.clear();
     const dying = child;
     child = null;
+    handshake = null;
+    established = false;
     if (dying === null)
       return;
     try {
@@ -329,7 +433,7 @@ function openGraphClient(executable, options = {}) {
       dying.kill();
     } catch {}
   };
-  const drain = (stream, onLine) => {
+  const drain = (owner, stream, onLine) => {
     (async () => {
       const reader = stream.getReader();
       const decoder = new TextDecoder;
@@ -343,7 +447,7 @@ function openGraphClient(executable, options = {}) {
             continue;
           buffer += decoder.decode(value, { stream: true });
           if (buffer.length > OUTPUT_LIMIT_BYTES) {
-            teardown(`the graph session wrote more than ${OUTPUT_LIMIT_BYTES} bytes without a complete line`);
+            teardown(`the graph session wrote more than ${OUTPUT_LIMIT_BYTES} bytes without a complete line`, owner);
             return;
           }
           let newline = buffer.indexOf(`
@@ -360,7 +464,7 @@ function openGraphClient(executable, options = {}) {
       } finally {
         await reader.cancel().catch(() => {});
         if (onLine !== null)
-          teardown("the graph session ended");
+          teardown("the graph session ended", owner);
       }
     })();
   };
@@ -387,9 +491,10 @@ function openGraphClient(executable, options = {}) {
     if (active === null)
       return null;
     const id = ++nextId;
+    const bound = budgeted(timeoutMs);
     const answered = Promise.withResolvers();
     pending.set(id, answered.resolve);
-    const deadline = AbortSignal.timeout(timeoutMs);
+    const deadline = AbortSignal.timeout(bound);
     const expired = Promise.withResolvers();
     deadline.addEventListener("abort", () => expired.resolve(EXPIRED), { once: true });
     try {
@@ -398,14 +503,14 @@ function openGraphClient(executable, options = {}) {
       await active.stdin.flush();
     } catch (error) {
       pending.delete(id);
-      teardown(`the graph session would not accept a request: ${error instanceof Error ? error.message : String(error)}`);
+      teardown(`the graph session would not accept a request: ${error instanceof Error ? error.message : String(error)}`, active);
       return null;
     }
     const response = await Promise.race([answered.promise, expired.promise]);
     if (response === EXPIRED) {
       pending.delete(id);
-      teardown(`${method} did not answer within ${timeoutMs}ms`);
-      debug(`graph query ${method} exceeded ${timeoutMs}ms`);
+      teardown(`${method} did not answer within ${bound}ms`, active);
+      debug(`graph query ${method} exceeded ${bound}ms`);
       return null;
     }
     if (typeof response !== "object" || response === null)
@@ -418,54 +523,67 @@ function openGraphClient(executable, options = {}) {
     }
     return "result" in response ? response.result ?? null : null;
   };
-  const ready = async () => {
-    if (closed)
+  const open = async () => {
+    let started;
+    try {
+      started = Bun.spawn([executable], { stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+    } catch (error) {
+      debug(`graph session would not start: ${error instanceof Error ? error.message : String(error)}`);
       return false;
-    if (handshake !== null)
-      return await handshake;
-    handshake = (async () => {
-      try {
-        child = Bun.spawn([executable], { stdout: "pipe", stderr: "pipe", stdin: "pipe" });
-      } catch (error) {
-        debug(`graph session would not start: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      }
-      drain(child.stdout, receive);
-      drain(child.stderr, null);
-      const initialized = await request("initialize", {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: "omp-codebase-memory", version: "0" }
-      }, HANDSHAKE_TIMEOUT_MS);
-      if (initialized === null) {
-        teardown("the graph session did not complete its handshake");
-        return false;
-      }
-      const active = child;
-      if (active === null)
-        return false;
-      try {
-        active.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}
+    }
+    child = started;
+    drain(started, started.stdout, receive);
+    drain(started, started.stderr, null);
+    const initialized = await request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "omp-codebase-memory", version: "0" }
+    }, HANDSHAKE_TIMEOUT_MS);
+    if (initialized === null) {
+      teardown("the graph session did not complete its handshake", started);
+      return false;
+    }
+    if (child !== started)
+      return false;
+    try {
+      started.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}
 `);
-        await active.stdin.flush();
-      } catch (error) {
-        teardown("the graph session would not accept the initialized notification: " + `${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      }
-      return true;
-    })();
-    return await handshake;
+      await started.stdin.flush();
+    } catch (error) {
+      teardown("the graph session would not accept the initialized notification: " + `${error instanceof Error ? error.message : String(error)}`, started);
+      return false;
+    }
+    if (child !== started)
+      return false;
+    established = true;
+    return true;
   };
-  const readyWithin = async (ms) => {
-    const started = ready();
-    const deadline = AbortSignal.timeout(ms);
-    const expired = Promise.withResolvers();
-    deadline.addEventListener("abort", () => expired.resolve(false), { once: true });
-    return await Promise.race([started, expired.promise]);
+  const ready = async () => {
+    if (closed || declined)
+      return false;
+    const inFlight = handshake;
+    if (inFlight !== null)
+      return await inFlight;
+    if (opens > REOPEN_LIMIT)
+      return false;
+    opens += 1;
+    const started = open();
+    handshake = started;
+    const opened = await started;
+    if (!opened) {
+      declined = true;
+      if (handshake === started)
+        handshake = null;
+    }
+    return opened;
+  };
+  const readyNow = () => {
+    ready().catch(() => {});
+    return established;
   };
   return {
     async call(tool, args) {
-      if (!await readyWithin(queryTimeoutMs))
+      if (!readyNow())
         return null;
       const result = await request("tools/call", { name: tool, arguments: args }, queryTimeoutMs);
       if (typeof result !== "object" || result === null)
@@ -489,7 +607,7 @@ function openGraphClient(executable, options = {}) {
     },
     close() {
       closed = true;
-      teardown("the graph session was closed");
+      teardown("the graph session was closed", child);
     }
   };
 }

@@ -135,22 +135,39 @@ function haveTool(tool, pathEnv) {
 // src/graph.ts
 var HANDSHAKE_TIMEOUT_MS = 20000;
 var QUERY_TIMEOUT_MS = 300;
+var COMMAND_TIMEOUT_MS = 1e4;
+var REOPEN_LIMIT = 2;
 var PROTOCOL_VERSION = "2024-11-05";
 var EXPIRED = Symbol("deadline");
 function openGraphClient(executable, options = {}) {
   const queryTimeoutMs = options.queryTimeoutMs ?? QUERY_TIMEOUT_MS;
+  const totalTimeoutMs = options.totalTimeoutMs;
   const debug = options.onDebug ?? (() => {});
+  let expiresAt = null;
+  const budgeted = (timeoutMs) => {
+    if (totalTimeoutMs === undefined)
+      return timeoutMs;
+    expiresAt ??= Date.now() + totalTimeoutMs;
+    return Math.max(0, Math.min(timeoutMs, expiresAt - Date.now()));
+  };
   let child = null;
   let handshake = null;
+  let established = false;
+  let declined = false;
+  let opens = 0;
   let closed = false;
   let nextId = 0;
   const pending = new Map;
-  const teardown = (reason) => {
+  const teardown = (reason, owner) => {
+    if (owner !== child)
+      return;
     for (const settle of pending.values())
       settle({ error: { message: reason } });
     pending.clear();
     const dying = child;
     child = null;
+    handshake = null;
+    established = false;
     if (dying === null)
       return;
     try {
@@ -160,7 +177,7 @@ function openGraphClient(executable, options = {}) {
       dying.kill();
     } catch {}
   };
-  const drain = (stream, onLine) => {
+  const drain = (owner, stream, onLine) => {
     (async () => {
       const reader = stream.getReader();
       const decoder = new TextDecoder;
@@ -174,7 +191,7 @@ function openGraphClient(executable, options = {}) {
             continue;
           buffer += decoder.decode(value, { stream: true });
           if (buffer.length > OUTPUT_LIMIT_BYTES) {
-            teardown(`the graph session wrote more than ${OUTPUT_LIMIT_BYTES} bytes without a complete line`);
+            teardown(`the graph session wrote more than ${OUTPUT_LIMIT_BYTES} bytes without a complete line`, owner);
             return;
           }
           let newline = buffer.indexOf(`
@@ -191,7 +208,7 @@ function openGraphClient(executable, options = {}) {
       } finally {
         await reader.cancel().catch(() => {});
         if (onLine !== null)
-          teardown("the graph session ended");
+          teardown("the graph session ended", owner);
       }
     })();
   };
@@ -218,9 +235,10 @@ function openGraphClient(executable, options = {}) {
     if (active === null)
       return null;
     const id = ++nextId;
+    const bound = budgeted(timeoutMs);
     const answered = Promise.withResolvers();
     pending.set(id, answered.resolve);
-    const deadline = AbortSignal.timeout(timeoutMs);
+    const deadline = AbortSignal.timeout(bound);
     const expired = Promise.withResolvers();
     deadline.addEventListener("abort", () => expired.resolve(EXPIRED), { once: true });
     try {
@@ -229,14 +247,14 @@ function openGraphClient(executable, options = {}) {
       await active.stdin.flush();
     } catch (error) {
       pending.delete(id);
-      teardown(`the graph session would not accept a request: ${error instanceof Error ? error.message : String(error)}`);
+      teardown(`the graph session would not accept a request: ${error instanceof Error ? error.message : String(error)}`, active);
       return null;
     }
     const response = await Promise.race([answered.promise, expired.promise]);
     if (response === EXPIRED) {
       pending.delete(id);
-      teardown(`${method} did not answer within ${timeoutMs}ms`);
-      debug(`graph query ${method} exceeded ${timeoutMs}ms`);
+      teardown(`${method} did not answer within ${bound}ms`, active);
+      debug(`graph query ${method} exceeded ${bound}ms`);
       return null;
     }
     if (typeof response !== "object" || response === null)
@@ -249,54 +267,67 @@ function openGraphClient(executable, options = {}) {
     }
     return "result" in response ? response.result ?? null : null;
   };
-  const ready = async () => {
-    if (closed)
+  const open = async () => {
+    let started;
+    try {
+      started = Bun.spawn([executable], { stdout: "pipe", stderr: "pipe", stdin: "pipe" });
+    } catch (error) {
+      debug(`graph session would not start: ${error instanceof Error ? error.message : String(error)}`);
       return false;
-    if (handshake !== null)
-      return await handshake;
-    handshake = (async () => {
-      try {
-        child = Bun.spawn([executable], { stdout: "pipe", stderr: "pipe", stdin: "pipe" });
-      } catch (error) {
-        debug(`graph session would not start: ${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      }
-      drain(child.stdout, receive);
-      drain(child.stderr, null);
-      const initialized = await request("initialize", {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: "omp-codebase-memory", version: "0" }
-      }, HANDSHAKE_TIMEOUT_MS);
-      if (initialized === null) {
-        teardown("the graph session did not complete its handshake");
-        return false;
-      }
-      const active = child;
-      if (active === null)
-        return false;
-      try {
-        active.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}
+    }
+    child = started;
+    drain(started, started.stdout, receive);
+    drain(started, started.stderr, null);
+    const initialized = await request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "omp-codebase-memory", version: "0" }
+    }, HANDSHAKE_TIMEOUT_MS);
+    if (initialized === null) {
+      teardown("the graph session did not complete its handshake", started);
+      return false;
+    }
+    if (child !== started)
+      return false;
+    try {
+      started.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}
 `);
-        await active.stdin.flush();
-      } catch (error) {
-        teardown("the graph session would not accept the initialized notification: " + `${error instanceof Error ? error.message : String(error)}`);
-        return false;
-      }
-      return true;
-    })();
-    return await handshake;
+      await started.stdin.flush();
+    } catch (error) {
+      teardown("the graph session would not accept the initialized notification: " + `${error instanceof Error ? error.message : String(error)}`, started);
+      return false;
+    }
+    if (child !== started)
+      return false;
+    established = true;
+    return true;
   };
-  const readyWithin = async (ms) => {
-    const started = ready();
-    const deadline = AbortSignal.timeout(ms);
-    const expired = Promise.withResolvers();
-    deadline.addEventListener("abort", () => expired.resolve(false), { once: true });
-    return await Promise.race([started, expired.promise]);
+  const ready = async () => {
+    if (closed || declined)
+      return false;
+    const inFlight = handshake;
+    if (inFlight !== null)
+      return await inFlight;
+    if (opens > REOPEN_LIMIT)
+      return false;
+    opens += 1;
+    const started = open();
+    handshake = started;
+    const opened = await started;
+    if (!opened) {
+      declined = true;
+      if (handshake === started)
+        handshake = null;
+    }
+    return opened;
+  };
+  const readyNow = () => {
+    ready().catch(() => {});
+    return established;
   };
   return {
     async call(tool, args) {
-      if (!await readyWithin(queryTimeoutMs))
+      if (!readyNow())
         return null;
       const result = await request("tools/call", { name: tool, arguments: args }, queryTimeoutMs);
       if (typeof result !== "object" || result === null)
@@ -320,7 +351,7 @@ function openGraphClient(executable, options = {}) {
     },
     close() {
       closed = true;
-      teardown("the graph session was closed");
+      teardown("the graph session was closed", child);
     }
   };
 }
@@ -1494,15 +1525,8 @@ function ompCodebaseMemory(pi) {
   const debug = (message) => {
     pi.logger.info("omp-codebase-memory: graph", { message });
   };
-  const indexProbe = (cwd) => {
-    return async (executable) => {
-      const client = openGraphClient(executable, { onDebug: debug });
-      try {
-        return await projectResolver(client, cwd).resolve();
-      } finally {
-        client.close();
-      }
-    };
+  const checkDebug = (message) => {
+    pi.logger.info("omp-codebase-memory: check", { message });
   };
   pi.registerCommand("cbm", {
     description: "codebase-memory-mcp lifecycle: status, install, update, pin, unpin, uninstall",
@@ -1518,7 +1542,7 @@ function ompCodebaseMemory(pi) {
       }
       switch (subcommand) {
         case "status": {
-          const report_ = await status(lifecycle, indexProbe(ctx.cwd));
+          const report_ = await status(lifecycle, indexProbe(ctx.cwd, debug));
           notify(ctx, ["codebase-memory-mcp", ...report_.lines].join(`
 `), "info");
           return;
@@ -1549,20 +1573,6 @@ function ompCodebaseMemory(pi) {
     available: ctx.hasUI,
     ask: (title, message) => ctx.ui.confirm(title, message)
   });
-  const driftCheck = async (active, ctx) => {
-    const resolution = await resolveExecutable(active.host, await readState(active.host));
-    if (!resolution.ok)
-      return;
-    const version = await resolvedVersion(resolution.resolved) ?? resolution.resolved.executable;
-    const client = openGraphClient(resolution.resolved.executable, { onDebug: debug });
-    try {
-      const notice = await checkToolSurface(client, version, { onDebug: debug });
-      if (notice !== null)
-        notifyOnce(ctx, `codebase-memory-mcp: ${notice}`, "warning");
-    } finally {
-      client.close();
-    }
-  };
   pi.on("session_start", async (_event, ctx) => {
     if (lifecycle === null)
       return;
@@ -1586,25 +1596,59 @@ function ompCodebaseMemory(pi) {
         error: error instanceof Error ? error.message : String(error)
       });
     }
-    const scheduler = schedulerFrom(ctx);
-    scheduler.after(() => {
-      checkUpstream(active).then((check) => {
-        if (check.kind === "newer")
-          notifyOnce(ctx, `codebase-memory-mcp: ${check.message}`, "info");
-        else
-          pi.logger.info("omp-codebase-memory: version check", { check: check.message });
-      }).catch((error) => {
-        pi.logger.info("omp-codebase-memory: version check failed", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      }).then(async () => await driftCheck(active, ctx)).catch((error) => {
-        pi.logger.info("omp-codebase-memory: tool-surface check failed", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-    }, CHECK_DELAY_MS);
+    deferChecks(active, schedulerFrom(ctx), {
+      notify: (message, type) => notifyOnce(ctx, `codebase-memory-mcp: ${message}`, type),
+      debug: checkDebug
+    });
   });
 }
+function indexProbe(cwd, onDebug) {
+  return async (executable) => {
+    const client = openGraphClient(executable, {
+      queryTimeoutMs: COMMAND_TIMEOUT_MS,
+      totalTimeoutMs: COMMAND_TIMEOUT_MS,
+      onDebug
+    });
+    try {
+      if (await client.toolNames() === null)
+        return { kind: "unavailable" };
+      return await projectResolver(client, cwd).resolve();
+    } finally {
+      client.close();
+    }
+  };
+}
+function deferChecks(active, scheduler, sinks) {
+  scheduler.after(() => {
+    checkUpstream(active).then((check) => {
+      if (check.kind === "newer")
+        sinks.notify(check.message, "info");
+      else
+        sinks.debug(`version check: ${check.message}`);
+    }).catch((error) => {
+      sinks.debug(`version check failed: ${error instanceof Error ? error.message : String(error)}`);
+    }).then(async () => await driftCheck(active, sinks)).catch((error) => {
+      sinks.debug(`tool-surface check failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, CHECK_DELAY_MS);
+}
+async function driftCheck(active, sinks) {
+  const resolution = await resolveExecutable(active.host, await readState(active.host));
+  if (!resolution.ok)
+    return;
+  const version = await resolvedVersion(resolution.resolved) ?? resolution.resolved.executable;
+  const client = openGraphClient(resolution.resolved.executable, { onDebug: sinks.debug });
+  try {
+    const notice = await checkToolSurface(client, version, { onDebug: sinks.debug });
+    if (notice !== null)
+      sinks.notify(notice, "warning");
+  } finally {
+    client.close();
+  }
+}
 export {
-  ompCodebaseMemory as default
+  indexProbe,
+  deferChecks,
+  ompCodebaseMemory as default,
+  CHECK_DELAY_MS
 };

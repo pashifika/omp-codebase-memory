@@ -23,10 +23,28 @@ export interface FakeGraphOptions {
   readonly toolNames?: readonly string[];
   /** How long a `tools/call` waits before answering. Used to exceed the deadline. */
   readonly delayMs?: number;
+  /**
+   * The one tool {@link delayMs} applies to. Omitted delays every
+   * `tools/call`.
+   *
+   * A test that watches a session recover from a missed deadline needs the
+   * replacement session to answer, and a delay counted per process would stall
+   * that one too -- so the delay is aimed at a tool rather than at a count.
+   */
+  readonly delayTool?: string;
   /** Exit without answering `initialize`. */
   readonly refuseHandshake?: boolean;
   /** How long `initialize` waits before answering, to outlast a caller's deadline. */
   readonly handshakeDelayMs?: number;
+  /**
+   * How long `tools/list` waits before answering.
+   *
+   * The second stall a caller waiting for readiness pays. A server that hand
+   * shakes and then goes quiet is not the same failure as one that never hand
+   * shakes: the client marks the session established, so a caller's handshake
+   * bound is already spent and only what governs this request is left.
+   */
+  readonly toolListDelayMs?: number;
   /** Answer `tools/call` with a line that is not JSON. */
   readonly garbage?: boolean;
   /** Answer `tools/call` with one line longer than the client's cap. */
@@ -35,6 +53,17 @@ export interface FakeGraphOptions {
   readonly exitOnCall?: boolean;
   /** Answer `list_projects` with the environment the process was given. */
   readonly echoEnv?: boolean;
+  /**
+   * A file each started stdio session appends its pid to.
+   *
+   * The only way a test can tell "did not retry" from "retried and failed
+   * again": both answer `null`, and the difference is whether a second process
+   * exists. Read it with {@link recordedStarts}. A `--version` invocation is
+   * not a session and is not recorded.
+   */
+  readonly startLog?: string;
+  /** The version `--version` reports, so the fake can stand in as the resolved executable. */
+  readonly version?: string;
 }
 
 /**
@@ -50,7 +79,32 @@ export async function writeFakeGraph(file: string, options: FakeGraphOptions = {
   await chmod(file, 0o755);
 }
 
+/**
+ * The pids of the sessions a fake with `startLog` has started, in order.
+ *
+ * An absent file means none: the client is lazy, so "nothing started" is the
+ * state where the log was never created.
+ */
+export async function recordedStarts(file: string): Promise<readonly number[]> {
+  const log = Bun.file(file);
+  if (!(await log.exists())) return [];
+  return (await log.text())
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => Number.parseInt(line, 10));
+}
+
 const SERVER = String.raw`
+import { appendFileSync } from "node:fs";
+
+// Answered before anything else and without recording a start: resolution asks
+// the candidate for its version, and that invocation is not a session.
+if (process.argv.includes("--version")) {
+  process.stdout.write("codebase-memory-mcp " + (options.version ?? "0.0.0") + "\n");
+  process.exit(0);
+}
+if (options.startLog !== undefined) appendFileSync(options.startLog, process.pid + "\n");
+
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 
 let buffer = "";
@@ -79,6 +133,7 @@ process.stdin.on("data", async (chunk) => {
     }
 
     if (request.method === "tools/list") {
+      if (options.toolListDelayMs !== undefined) await Bun.sleep(options.toolListDelayMs);
       const result = options.toolNames === undefined ? {} : { tools: options.toolNames.map((name) => ({ name })) };
       send({ jsonrpc: "2.0", id: request.id, result });
       continue;
@@ -86,7 +141,10 @@ process.stdin.on("data", async (chunk) => {
 
     if (request.method === "tools/call") {
       if (options.exitOnCall === true) process.exit(0);
-      if (options.delayMs !== undefined) await Bun.sleep(options.delayMs);
+      const tool = request.params?.name;
+      if (options.delayMs !== undefined && (options.delayTool === undefined || options.delayTool === tool)) {
+        await Bun.sleep(options.delayMs);
+      }
       if (options.garbage === true) {
         process.stdout.write("this is not json\n");
         continue;
@@ -96,7 +154,6 @@ process.stdin.on("data", async (chunk) => {
         continue;
       }
 
-      const tool = request.params?.name;
       if (options.echoEnv === true && tool === "list_projects") {
         send({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { env: process.env }, isError: false } });
         continue;

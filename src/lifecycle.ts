@@ -50,7 +50,10 @@ export interface StatusReport {
  * there is nothing to ask.
  *
  * The caller is expected to answer through `projectResolver`, so status and the
- * augmentation derive the project the same way and cannot name different ones.
+ * augmentation make the same selection over the same `list_projects` answer.
+ * The two resolutions are independent -- the augmentation is a separate feature
+ * entry that may not be loaded at all -- so what they share is the rule, not
+ * the result.
  */
 export type IndexProbe = (executable: string) => Promise<ProjectResolution>;
 
@@ -85,8 +88,8 @@ export interface CheckReport {
  * the report correspond to what the operator can actually do. An unindexed
  * directory is stated plainly rather than as an error: nothing in this package
  * indexes a repository, and the shipped skill and rule already tell the model to
- * confirm the project with `list_projects` or `index_status` -- `index_repository`
- * is in its own tool surface, so the agent is the actor and a second path here
+ * confirm the project with `list_projects` or `index_status` -- indexing is a
+ * tool in that same surface, so the agent is the actor and a second path here
  * would duplicate it.
  */
 export async function status(lifecycle: Lifecycle, index: IndexProbe): Promise<StatusReport> {

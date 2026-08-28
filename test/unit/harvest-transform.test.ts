@@ -78,6 +78,31 @@ const scalarCases: ScalarCase[] = [
     frontmatter: "description: 'it''s here'",
     expected: "it's here",
   },
+  {
+    scenario: "a trailing comment is dropped from a plain scalar, the way a reader resolves it",
+    frontmatter: "description: plain text # and a note",
+    expected: "plain text",
+  },
+  {
+    scenario: "a comment written after the closing quote is dropped too",
+    frontmatter: 'description: "quoted text" # and a note',
+    expected: "quoted text",
+  },
+  {
+    scenario: "a `#` inside quoting is content, not a comment",
+    frontmatter: 'description: "issue #12 is fixed"',
+    expected: "issue #12 is fixed",
+  },
+  {
+    scenario: "a `#` with no whitespace before it is content, since YAML opens a comment only after a space",
+    frontmatter: "description: a#b",
+    expected: "a#b",
+  },
+  {
+    scenario: "a value that is nothing but a comment reads as absent",
+    frontmatter: "description: # nothing here",
+    expected: null,
+  },
   { scenario: "a key with an empty value reads as absent", frontmatter: "description:", expected: null },
   { scenario: "a key that is not present reads as absent", frontmatter: "name: x", expected: null },
 ];
@@ -136,6 +161,18 @@ describe("the rule transform", () => {
 
   test("refuses a source that has started carrying frontmatter of its own", () => {
     expect(() => transformRule("---\ndescription: upstream added this\n---\nbody\n")).toThrow(HarvestError);
+  });
+
+  test("refuses a source that opens with a `---` thematic break, which parses as frontmatter with no keys", () => {
+    // The shape that walked past the key check: an opening `---` makes the
+    // scanner look for a closing one, and prose between the two records no key
+    // at all -- so the body carried over would silently start after the second
+    // delimiter while the whole source got re-emitted underneath a second
+    // frontmatter block.
+    const broken = "---\n\nSome upstream prose.\n\n---\n\n# Heading\n\nbody\n";
+    expect(parseDocument(broken).keys).toEqual([]);
+    expect(() => transformRule(broken)).toThrow(HarvestError);
+    expect(() => transformRule(broken)).toThrow("opens with `---`");
   });
 
   test("refuses a source with no prose to derive a description from", () => {
@@ -244,11 +281,6 @@ const guardCases: GuardCase[] = [
     names: "no bucket",
   },
   {
-    scenario: "a rule reinstating alwaysApply by hand is refused",
-    artifact: { kind: "rule", path: RULE_PATH, content: "---\ndescription: d\nalwaysApply: true\n---\nbody\n" },
-    names: "rulebook-only",
-  },
-  {
     scenario: "a generated rule named RULES.md is refused",
     artifact: { kind: "rule", path: "rules/RULES.md", content: "---\ndescription: d\n---\nbody\n" },
     names: "sticky operator rules",
@@ -280,6 +312,15 @@ const guardCases: GuardCase[] = [
     },
     names: "mcp__",
   },
+  {
+    scenario: "an agent whose path escapes the agents directory is refused",
+    artifact: {
+      kind: "agent",
+      path: "agents/../../evil.md",
+      content: `---\nname: ../../evil\ndescription: d\ntools: ${AGENT_TOOLS}\n---\nbody\n`,
+    },
+    names: "directly under",
+  },
 ];
 
 test.each(guardCases)("$scenario", ({ artifact, names }) => {
@@ -287,10 +328,96 @@ test.each(guardCases)("$scenario", ({ artifact, names }) => {
   expect(() => guardArtifact(artifact)).toThrow(names);
 });
 
+interface AlwaysApplyCase {
+  readonly scenario: string;
+  /** The value as a YAML author might spell it, quoting included. */
+  readonly value: string;
+  /** Whether the guard must refuse it. */
+  readonly refused: boolean;
+}
+
+/**
+ * Every spelling of `alwaysApply` the guard has to recognise, and the one it
+ * knowingly does not.
+ *
+ * The guard defends a deliberate reversal -- the rule ships rulebook-only,
+ * because its body's "always prefer MCP graph tools" contradicts OMP's own
+ * `lsp` policy if it is injected every turn. Recognising one spelling of true
+ * would leave four ways to reinstate the key by hand and still pass the build.
+ *
+ * The last case is a gap pinned rather than a behaviour endorsed: an
+ * explicitly tagged `!!bool true` reaches the spelling table whole and is
+ * allowed. It is recorded here so that the docstring on `TRUE_SPELLINGS`, which
+ * says so, cannot quietly stop matching the code -- and so that closing it
+ * later is a test flipping rather than a discovery.
+ */
+const alwaysApplyCases: AlwaysApplyCase[] = [
+  { scenario: "alwaysApply: `true` is refused", value: "true", refused: true },
+  { scenario: "alwaysApply: `True` is refused", value: "True", refused: true },
+  { scenario: "alwaysApply: `TRUE` is refused", value: "TRUE", refused: true },
+  { scenario: "alwaysApply: YAML 1.1's `yes` is refused", value: "yes", refused: true },
+  { scenario: "alwaysApply: YAML 1.1's `on` is refused", value: "on", refused: true },
+  {
+    scenario: 'alwaysApply: a quoted `"true"` is refused, since `scalar` unwraps the quoting',
+    value: '"true"',
+    refused: true,
+  },
+  {
+    scenario: "alwaysApply: `true` with a trailing comment is refused, since a comment is not part of the value",
+    value: "true # keep this, the graph rule is load-bearing",
+    refused: true,
+  },
+  {
+    scenario: 'alwaysApply: a quoted `"true"` with a trailing comment is refused as well',
+    value: '"true" # keep',
+    refused: true,
+  },
+  {
+    scenario: "alwaysApply: an explicitly tagged `!!bool true` is a known gap and is allowed through",
+    value: "!!bool true",
+    refused: false,
+  },
+  {
+    scenario: "alwaysApply: `false` is allowed, because the guard reads the value rather than the key",
+    value: "false",
+    refused: false,
+  },
+  { scenario: "alwaysApply: `no` is allowed", value: "no", refused: false },
+];
+
+test.each(alwaysApplyCases)("$scenario", ({ value, refused }) => {
+  const artifact: Artifact = {
+    kind: "rule",
+    path: RULE_PATH,
+    content: `---\ndescription: d\nalwaysApply: ${value}\n---\nbody\n`,
+  };
+  if (!refused) {
+    expect(() => guardArtifact(artifact)).not.toThrow();
+    return;
+  }
+  expect(() => guardArtifact(artifact)).toThrow(HarvestError);
+  expect(() => guardArtifact(artifact)).toThrow("rulebook-only");
+});
+
+test("an emitted agent whose name would escape the agents directory is refused", () => {
+  // The path is interpolated straight from the frontmatter `name`, and the
+  // caller writes to `path.join(root, artifact.path)` -- so a `../` reaches
+  // outside the repository, and outside the directories the pipeline deletes
+  // and rewrites.
+  const hostile = "---\nname: ../../../etc/evil\ndescription: handoff\n---\nbody\n";
+  expect(() => transformAgent(hostile)).toThrow(HarvestError);
+  expect(() => transformAgent(hostile)).toThrow("directly under");
+});
+
 test("every guard case names a distinct scenario", () => {
-  const scenarios = [...guardCases, ...agentCases, ...directShapeCases, ...directKeyCases, ...scalarCases].map(
-    (kase) => kase.scenario,
-  );
+  const scenarios = [
+    ...guardCases,
+    ...agentCases,
+    ...directShapeCases,
+    ...directKeyCases,
+    ...scalarCases,
+    ...alwaysApplyCases,
+  ].map((kase) => kase.scenario);
   expect(new Set(scenarios).size).toBe(scenarios.length);
 });
 

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -99,8 +100,11 @@ describe("the committed rule", () => {
   });
 
   test("is the only file under rules/, so no second rule can claim the reserved name", async () => {
-    const rules = provenance.generated.filter((relative) => relative.startsWith("rules/"));
-    expect(rules).toEqual([RULE_PATH]);
+    // The directory, not the provenance list. The list is what the pipeline
+    // says it wrote; a second rule arrives by a hand edit or a bad merge, which
+    // is precisely the case where the two disagree.
+    const listed = await readdir(path.join(ROOT, path.dirname(RULE_PATH)), { recursive: true });
+    expect(listed.sort()).toEqual([path.basename(RULE_PATH)]);
   });
 });
 

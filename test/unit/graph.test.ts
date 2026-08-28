@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { openGraphClient, QUERY_TIMEOUT_MS } from "../../src/graph.ts";
 import { dropScratch, makeScratch, type Scratch } from "../support/scratch.ts";
-import { writeFakeGraph, type FakeGraphOptions } from "../support/fake-graph.ts";
+import { recordedStarts, writeFakeGraph, type FakeGraphOptions } from "../support/fake-graph.ts";
 
 import type { GraphClient } from "../../src/graph.ts";
 
@@ -56,6 +56,43 @@ async function fakeClient(options: FakeGraphOptions, queryTimeoutMs = QUERY_TIME
  */
 async function warm(client: GraphClient): Promise<void> {
   await client.toolNames();
+}
+
+/**
+ * Waits for `condition`, polling rather than sleeping a guessed duration.
+ *
+ * The tick is a real one, deliberately: what is being waited for happens in
+ * another process -- a child dying, a handshake landing -- and a fake clock in
+ * this process does not reach it. Polling for the condition is what keeps the
+ * wait proportional to the machine instead of to a number guessed here, and the
+ * budget only bounds a failure.
+ */
+async function until(condition: () => boolean | Promise<boolean>, budgetMs = 10_000): Promise<boolean> {
+  const deadline = performance.now() + budgetMs;
+  for (;;) {
+    if (await condition()) return true;
+    if (performance.now() >= deadline) return false;
+    await Bun.sleep(20);
+  }
+}
+
+/** Whether `pid` still names a live process. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The pid of the fake's `index`-th session, failing the test when it never started. */
+async function startedPid(file: string, index: number): Promise<number> {
+  const starts = await recordedStarts(file);
+  const pid = starts[index];
+  expect(pid).toBeDefined();
+  if (pid === undefined) throw new Error(`the fake started no session ${index}`);
+  return pid;
 }
 
 describe("a working session", () => {
@@ -113,11 +150,6 @@ interface FailureCase {
   readonly options: FakeGraphOptions;
   /** A tighter deadline where the case is about exceeding it. */
   readonly queryTimeoutMs?: number;
-  /**
-   * Complete the handshake first, so the failure under test is the query's own.
-   * Omitted where the handshake is the failure.
-   */
-  readonly warmFirst?: boolean;
 }
 
 /**
@@ -134,18 +166,21 @@ const failureCases: FailureCase[] = [
     scenario: "a query that exceeds its deadline yields null",
     options: { tools: { list_projects: { projects: [] } }, delayMs: 400 },
     queryTimeoutMs: 50,
-    warmFirst: true,
   },
-  { scenario: "a server that exits mid-request yields null", options: { exitOnCall: true }, warmFirst: true },
-  { scenario: "an unparseable answer yields null", options: { garbage: true }, warmFirst: true },
-  { scenario: "an answer larger than the cap yields null", options: { flood: true }, warmFirst: true },
-  { scenario: "a tool that reports isError yields null", options: { tools: {} }, warmFirst: true },
+  { scenario: "a server that exits mid-request yields null", options: { exitOnCall: true } },
+  { scenario: "an unparseable answer yields null", options: { garbage: true } },
+  { scenario: "an answer larger than the cap yields null", options: { flood: true } },
+  { scenario: "a tool that reports isError yields null", options: { tools: {} } },
 ];
 
-test.each(failureCases)("$scenario", async ({ options, queryTimeoutMs, warmFirst }) => {
+test.each(failureCases)("$scenario", async ({ options, queryTimeoutMs }) => {
   const client = await fakeClient(options, queryTimeoutMs ?? QUERY_TIMEOUT_MS);
   try {
-    if (warmFirst === true) await warm(client);
+    // Every case settles the handshake first, including the one whose handshake
+    // is the failure. A query does not wait for a handshake, so without this
+    // each case would answer `null` for the trivial reason that the session was
+    // not ready yet and never reach the failure it names.
+    await warm(client);
     expect(await client.call("list_projects", {})).toBeNull();
   } finally {
     client.close();
@@ -184,14 +219,12 @@ test("a query does not wait for a slow handshake, and a later one succeeds", asy
     // loaded runner is what a bound close to the deadline would race.
     expect(waited).toBeLessThan(handshakeDelayMs / 2);
 
-    // Polled, not slept: the client exposes no readiness signal, and a
-    // successful answer *is* readiness. Each attempt is bounded by the same
-    // deadline, so this converges as soon as the handshake lands rather than
-    // after a duration guessed here.
+    // Polled, not counted: a query no longer costs its deadline to answer "not
+    // ready", so a fixed number of attempts would all land inside the handshake
+    // window and prove nothing. A successful answer *is* readiness, and the
+    // poll converges as soon as the handshake lands.
     let answered: unknown = null;
-    for (let attempt = 0; attempt < 40 && answered === null; attempt += 1) {
-      answered = await client.call("list_projects", {});
-    }
+    expect(await until(async () => (answered = await client.call("list_projects", {})) !== null)).toBe(true);
     expect(answered).toEqual({ projects: [] });
   } finally {
     client.close();
@@ -199,23 +232,154 @@ test("a query does not wait for a slow handshake, and a later one succeeds", asy
 }, SPAWN_BUDGET_MS);
 
 test("a closed client answers null without starting anything", async () => {
-  const client = await fakeClient({ tools: { list_projects: { projects: [] } } });
+  const starts = path.join(scratch.root, "starts");
+  const client = await fakeClient({ tools: { list_projects: { projects: [] } }, startLog: starts });
   client.close();
+
   expect(await client.call("list_projects", {})).toBeNull();
+  expect(await client.toolNames()).toBeNull();
   // Closing twice is a no-op rather than a throw, because `session_shutdown`
   // can arrive after a failure already tore the session down.
   client.close();
+
+  // The half the `null` above cannot show: a client closed before its first
+  // query must never spawn the executable, which is what makes `close()` on a
+  // session that never searched free rather than merely quiet.
+  expect(await recordedStarts(starts)).toEqual([]);
 }, SPAWN_BUDGET_MS);
 
+/**
+ * An executable that will not hand shake is asked exactly once.
+ *
+ * Two `null`s do not show this: a client that retried every query would answer
+ * `null` twice as well, at 2.9 s of handshake apiece against the real binary.
+ * The recorded starts are the difference, so the assertion is a count of
+ * processes rather than a count of failures.
+ */
 test("a failed open is not retried, so a declining executable costs one attempt", async () => {
-  const client = openGraphClient(path.join(scratch.root, "absent"), { queryTimeoutMs: 100 });
+  const starts = path.join(scratch.root, "starts");
+  const client = await fakeClient({ refuseHandshake: true, startLog: starts });
   try {
+    // `toolNames` waits for the handshake, so the failure has actually happened
+    // before the next attempt is made rather than still being in flight.
+    expect(await client.toolNames()).toBeNull();
+    expect(await client.toolNames()).toBeNull();
     expect(await client.call("list_projects", {})).toBeNull();
-    expect(await client.call("search_graph", {})).toBeNull();
+
+    expect(await recordedStarts(starts)).toHaveLength(1);
   } finally {
     client.close();
   }
-});
+}, SPAWN_BUDGET_MS);
+
+/**
+ * The sessions one client may start: the initial one plus the reopen ceiling.
+ *
+ * Named here rather than imported, because `src/graph.ts` keeps `REOPEN_LIMIT`
+ * private and a test that reads the subject's own constant asserts nothing about
+ * the number. What is asserted is the ceiling's existence and where it lands, so
+ * a change to it has to be made here too, deliberately.
+ */
+const SESSION_CEILING = 3;
+
+/**
+ * A query that misses its deadline ends the session, the next one reopens it,
+ * and the reopening stops.
+ *
+ * Three halves of one contract, which is what makes this one test rather than
+ * three. `graph-augmentation "Scenario: Deadline exceeded"` requires the
+ * subprocess to be terminated, and the reason is in the client: the reply to the
+ * abandoned request is still coming down that pipe, so the session cannot be
+ * reused as it stands. Asserting only the `null` leaves the termination
+ * unchecked, which is how a torn-down child could have been left running.
+ *
+ * The reopen is the second, and it is what stops the termination from being
+ * permanent. A torn-down session used to keep the resolved handshake of a child
+ * that no longer existed, so every later query answered `null` for the rest of
+ * the session -- one stall, and a session-long client with no graph context. The
+ * recorded starts are what distinguish a reopened session from a reused one, and
+ * the timing assertion says the reopen is paid in the background exactly as the
+ * first handshake is.
+ *
+ * The ceiling is the third, and it is the clause `graph-augmentation "Scenario:
+ * Queries share a persistent session"` states: an established session that ended
+ * early is replaced *at most a bounded number of times*. A reopen per stall is
+ * what that clause forbids, and against the real binary it would spend a ~2.9 s
+ * handshake on every query for the rest of a session whose server is sick. The
+ * loop below is what exercises it: two halves proved a replacement happens and
+ * that a failed FIRST open is not retried, but neither drives a third teardown,
+ * so the bound itself rested on code nothing ran. Both directions are asserted,
+ * because each fails a different mistake -- the start count says no fourth
+ * session was spawned, and the refusal poll says the client did not instead
+ * answer from a session it had torn down.
+ *
+ * The order matters twice. The first follow-up query is issued *before* the dead
+ * child is waited for, which is the tight case: the reopen starts while the old
+ * session's pipe has not yet reported EOF, so the drain loop of the child that
+ * died runs its teardown after the replacement exists. A teardown that did not
+ * check which session it belonged to would kill the replacement mid-handshake,
+ * and the poll below would never get an answer. And the start log is read after
+ * the refusal poll rather than before it, because the fake records its pid at
+ * startup: a fourth session spawned but slow to hand shake is caught only by a
+ * count taken after every opportunity to spawn it has passed.
+ */
+test("a query that misses its deadline ends the session, a later one reopens it, and the reopening stops", async () => {
+  const starts = path.join(scratch.root, "starts");
+  const client = await fakeClient(
+    // Only `search_graph` stalls: the replacement session has to be able to
+    // answer, or the reopen could not be observed at all.
+    {
+      tools: { list_projects: { projects: [] }, search_graph: { cols: [], groups: [] } },
+      delayMs: 5_000,
+      delayTool: "search_graph",
+      startLog: starts,
+    },
+    300,
+  );
+  try {
+    await warm(client);
+    const first = await startedPid(starts, 0);
+
+    expect(await client.call("search_graph", {})).toBeNull();
+
+    // Immediately, on purpose -- and it does not wait for the replacement
+    // either: a reopen is a handshake, and no query waits for one.
+    const asked = performance.now();
+    expect(await client.call("list_projects", {})).toBeNull();
+    expect(performance.now() - asked).toBeLessThan(100);
+
+    expect(await until(() => !alive(first))).toBe(true);
+
+    expect(await until(async () => (await client.call("list_projects", {})) !== null)).toBe(true);
+    const restarted = await recordedStarts(starts);
+    expect(restarted).toHaveLength(2);
+    expect(restarted[1]).not.toBe(first);
+
+    // Every replacement the ceiling still allows, stalled and recovered the same
+    // way, so the count below is reached by repeating the cycle rather than by
+    // arranging one special case.
+    for (let session = 2; session < SESSION_CEILING; session += 1) {
+      expect(await client.call("search_graph", {})).toBeNull();
+      expect(await until(async () => (await client.call("list_projects", {})) !== null)).toBe(true);
+      expect(await recordedStarts(starts)).toHaveLength(session + 1);
+    }
+
+    // One stall past the ceiling.
+    const last = await startedPid(starts, SESSION_CEILING - 1);
+    expect(await client.call("search_graph", {})).toBeNull();
+    expect(await until(() => !alive(last))).toBe(true);
+
+    // Not one refusal but every one this budget affords, each a fresh chance to
+    // open a session the ceiling forbids.
+    expect(await until(async () => (await client.call("list_projects", {})) !== null, 1_000)).toBe(false);
+
+    const ceiling = await recordedStarts(starts);
+    expect(ceiling).toHaveLength(SESSION_CEILING);
+    expect(new Set(ceiling).size).toBe(SESSION_CEILING);
+  } finally {
+    client.close();
+  }
+}, SPAWN_BUDGET_MS);
 
 /**
  * The cache-root prohibition, as a property of the source.

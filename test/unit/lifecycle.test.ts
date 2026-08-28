@@ -2,6 +2,8 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { COMMAND_TIMEOUT_MS } from "../../src/graph.ts";
+import { CHECK_DELAY_MS, deferChecks, indexProbe } from "../../src/index.ts";
 import {
   checkUpstream,
   CHECK_INTERVAL_MS,
@@ -19,6 +21,7 @@ import {
 } from "../../src/lifecycle.ts";
 import { entryStatus } from "../../src/mcp-config.ts";
 import {
+  agentDir,
   EXECUTABLE_NAME,
   managedExecutable,
   mcpConfigPath,
@@ -26,17 +29,26 @@ import {
   upstreamInstallDir,
 } from "../../src/paths.ts";
 import { describeTarget, type Target } from "../../src/platform.ts";
-import { projectResolver } from "../../src/project.ts";
 import { readState, updateState } from "../../src/state.ts";
+import { writeFakeGraph } from "../support/fake-graph.ts";
 import { buildArchive, dropBuiltArchives, fakeSource, releaseMembers } from "../support/release.ts";
 import { dropScratch, makeScratch, writeFakeExecutable, type Scratch } from "../support/scratch.ts";
 
-import type { GraphClient } from "../../src/graph.ts";
 import type { ProjectResolution } from "../../src/project.ts";
 import type { ReleaseSource } from "../../src/release.ts";
+import type { Scheduler, TimerHandle } from "../../src/scheduler.ts";
 
 const TARGET: Target = describeTarget(process.platform === "darwin" ? "darwin" : "linux", "arm64");
 const VERSION = "0.10.8";
+
+/**
+ * The budget for a test that spawns the fake graph server.
+ *
+ * Two subprocess starts through a `#!/usr/bin/env bun` shebang plus a
+ * deliberately slow handshake, against Bun's 5 s default. Generous enough that a
+ * timeout means something hung rather than that the runner was loaded.
+ */
+const SLOW_SPAWN_MS = 30_000;
 
 let scratch: Scratch;
 
@@ -429,41 +441,56 @@ describe("uninstall", () => {
    * on the account, so removing this package must not remove an index some
    * other editor is using.
    *
-   * Checked from both ends. Behaviourally: the project list the resolver
-   * reports is identical before and after, and `uninstall` made no graph call
-   * at all. And by name: `delete_project` exists in CBM's tool surface, so the
-   * assertion that this package never calls it is worth making where a future
-   * "tidy up on uninstall" would have to add it.
+   * Checked as a boundary rather than as an absence. `uninstall` takes no graph
+   * client, so "it made no graph call" is a fact about its signature and cannot
+   * fail; what can fail is the `rm`, which today names this package's own root
+   * and would name a cache root or the agent directory the moment someone
+   * widened it to "tidy up". So the test puts a file in each of the places
+   * CBM's own data lives and asserts they all outlive the uninstall.
    */
-  test("deletes no indexed project, and does not so much as ask the graph", async () => {
+  test("removes its own root and nothing CBM owns", async () => {
     const lifecycle = await lifecycleFor(VERSION);
     await install(lifecycle);
 
-    const asked: string[] = [];
-    const client: GraphClient = {
-      call: async (tool) => {
-        asked.push(tool);
-        return tool === "list_projects" ? { projects: [{ name: "app", root_path: scratch.home }] } : null;
-      },
-      toolNames: async () => null,
-      close: () => {},
-    };
-
-    const before = await projectResolver(client, scratch.home).resolve();
-    asked.length = 0;
+    // Each of these is a place CBM's own data lives, and none is under the root
+    // this command deletes: the cache holding the shared index, the agent
+    // directory holding other extensions' configuration, and upstream's own
+    // install directory holding an executable this package only ever adopts.
+    const foreign = [
+      path.join(scratch.home, ".cache", "codebase-memory", "graph.db"),
+      path.join(agentDir(scratch.host), "another-extension.json"),
+      path.join(upstreamInstallDir(scratch.host), EXECUTABLE_NAME),
+    ];
+    for (const file of foreign) await Bun.write(file, "belongs to something else");
 
     expect((await uninstall(lifecycle)).ok).toBe(true);
 
-    expect(asked).toEqual([]);
-    expect(await projectResolver(client, scratch.home).resolve()).toEqual(before);
+    expect(await Bun.file(packageRoot(scratch.host)).exists()).toBe(false);
+    for (const file of foreign) expect(await Bun.file(file).exists()).toBe(true);
   });
 
-  test("no lifecycle module names CBM's project-deleting tool", async () => {
+  /**
+   * Two tools this package must never call, refused by name in every module
+   * that could plausibly grow a call to one.
+   *
+   * `delete_project` would remove an index shared with every other client on the
+   * account. `index_repository` is the other half of the same rule and had no
+   * guard: CBM exposes it to the agent, the shipped skill and rule point the
+   * agent at it, and a lifecycle command that indexed on the operator's behalf
+   * would duplicate an action the MCP surface already offers -- with none of the
+   * agent's judgement about what is worth indexing.
+   */
+  test("no lifecycle module names CBM's project-deleting or repository-indexing tool", async () => {
     const modules = ["src/lifecycle.ts", "src/index.ts", "src/augment.ts", "src/augment-entry.ts", "src/project.ts"];
+    const refused = ["delete_project", "index_repository"];
+
+    const violations: string[] = [];
     for (const module of modules) {
       const source = await Bun.file(path.resolve(import.meta.dir, "..", "..", module)).text();
-      expect(source).not.toContain("delete_project");
+      for (const tool of refused) if (source.includes(tool)) violations.push(`${module}: ${tool}`);
     }
+
+    expect(violations).toEqual([]);
   });
 });
 
@@ -553,31 +580,147 @@ test.each(indexCases)("$scenario", async ({ probed, expected, absent }) => {
   if (absent !== undefined) expect(text.toLowerCase()).not.toContain(absent);
 });
 
-test("the resolver behind status and the augmentation is one implementation, reused in a session", async () => {
-  await writeFakeExecutable(path.join(scratch.pathDir, EXECUTABLE_NAME), `echo "codebase-memory-mcp ${VERSION}"`);
+/**
+ * The probe `/cbm status` actually uses, against a server that makes it wait.
+ *
+ * This is the one that was missing, and its absence is why the command shipped
+ * unable to answer. Every case above injects a probe, so the shape of the
+ * report was covered and the thing producing it was not: the real probe opened
+ * a session and asked immediately, a query deliberately refuses to wait for a
+ * handshake, and the handshake takes ~2.9 s warm against the real executable --
+ * so status could only ever print the third branch, "the graph did not answer".
+ *
+ * The fake's handshake delay is far longer than the 300 ms query deadline, so a
+ * probe that does not wait for readiness fails this deterministically rather
+ * than by timing.
+ */
+test("the real probe resolves the project against a server whose handshake outlasts a query deadline", async () => {
+  const graph = path.join(scratch.root, "graph-server");
+  await writeFakeGraph(graph, {
+    handshakeDelayMs: 700,
+    toolNames: ["list_projects", "search_graph"],
+    tools: { list_projects: { projects: [{ name: "graph-project", root_path: scratch.home }] } },
+  });
 
-  // One `list_projects` answer, one resolver, two consumers: whatever status
-  // reports is the same object the augmentation would have queried with.
-  let listed = 0;
-  const client: GraphClient = {
-    call: async (tool) => {
-      if (tool !== "list_projects") return null;
-      listed += 1;
-      return { projects: [{ name: "graph-project", root_path: scratch.home }] };
-    },
-    toolNames: async () => null,
-    close: () => {},
-  };
-  const resolver = projectResolver(client, path.join(scratch.home, "nested", "dir"));
+  const resolved = await indexProbe(path.join(scratch.home, "nested", "dir"), () => {})(graph);
 
-  const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource }, async () =>
-    await resolver.resolve(),
+  expect(resolved).toEqual({ kind: "project", project: { name: "graph-project", root: scratch.home } });
+}, SLOW_SPAWN_MS);
+
+/**
+ * The same probe against a wedged daemon, which is where it used to freeze.
+ *
+ * Waiting for readiness is what makes the probe able to answer at all, and it is
+ * also what put two 20 s deadlines in front of an operator: `toolNames()` waits
+ * for `initialize` and then asks `tools/list`, both charged the handshake
+ * ceiling that was chosen for a background warm-up where nobody waits. Measured
+ * against this same fake before the shared budget: 20,003 ms to answer
+ * `{"kind":"unavailable"}` for a typed `/cbm status`, where a working server
+ * answers in ~360 ms. The trigger is a CBM daemon that accepted a connection and
+ * stopped responding, which is exactly the condition the reopen path exists for.
+ *
+ * The elapsed time is asserted, because the return value alone was already
+ * correct at 20 s. The debug line is asserted with it: it names the deadline the
+ * client actually enforced, so this fails loudly rather than by timing if the
+ * budget stops reaching the handshake. The upper bound has 5 s of slack for a
+ * loaded runner's spawn and still separates 10 s from the 20 s it replaced.
+ */
+test("a typed status against a server that never hand shakes answers inside the command budget", async () => {
+  const graph = path.join(scratch.root, "wedged-server");
+  await writeFakeGraph(graph, { handshakeDelayMs: 120_000, toolNames: ["list_projects"] });
+  const debugLines: string[] = [];
+
+  const started = performance.now();
+  const resolved = await indexProbe(scratch.home, (message) => debugLines.push(message))(graph);
+  const elapsed = performance.now() - started;
+
+  expect(resolved).toEqual({ kind: "unavailable" });
+  expect(debugLines).toContain(`graph query initialize exceeded ${COMMAND_TIMEOUT_MS}ms`);
+  expect(elapsed).toBeLessThan(COMMAND_TIMEOUT_MS + 5_000);
+}, SLOW_SPAWN_MS);
+
+/**
+ * The same probe, reached the way the command reaches it.
+ *
+ * The fake answers `--version` as well as speaking stdio, so it is the resolved
+ * executable rather than a seam beside one: what this asserts is the two lines
+ * an operator actually reads.
+ */
+test("status names the project and its recorded root, from the probe the command passes", async () => {
+  await writeFakeGraph(path.join(scratch.pathDir, EXECUTABLE_NAME), {
+    version: VERSION,
+    handshakeDelayMs: 700,
+    toolNames: ["list_projects"],
+    tools: { list_projects: { projects: [{ name: "graph-project", root_path: scratch.home }] } },
+  });
+
+  const report = await status(
+    { host: scratch.host, target: TARGET, source: forbiddenSource },
+    indexProbe(scratch.home, () => {}),
   );
-  const forAugmentation = await resolver.resolve();
+  const text = report.lines.join("\n");
 
-  expect(listed).toBe(1);
-  expect(report.lines.join("\n")).toContain("index:      graph-project");
-  expect(forAugmentation).toEqual({ kind: "project", project: { name: "graph-project", root: scratch.home } });
+  expect(text).toContain("index:      graph-project");
+  expect(text).toContain(`index root: ${scratch.home}`);
+  expect(text).toContain(`version:    codebase-memory-mcp ${VERSION}`);
+}, SLOW_SPAWN_MS);
+
+/**
+ * A timer handle that is not a timer.
+ *
+ * `Scheduler.after` answers with OMP's managed handle type, and the test below
+ * runs the callback itself rather than letting a clock do it, so the handle only
+ * has to exist. Structural, so nothing is scheduled and nothing has to be
+ * cancelled.
+ */
+const INERT_TIMER: TimerHandle = {
+  ref: () => INERT_TIMER,
+  unref: () => INERT_TIMER,
+  hasRef: () => false,
+  refresh: () => INERT_TIMER,
+  [Symbol.toPrimitive]: () => 0,
+};
+
+/**
+ * The two deferred checks never sit between the operator and a usable session.
+ *
+ * `graph-augmentation "Scenario: Check does not delay session start"` requires
+ * the tool-surface check to run off the blocking path with a result that gates
+ * nothing, and the version check is a network request. So scheduling them must
+ * consult neither the network nor the executable -- the release source here
+ * throws on any call, and it is not reached until the callback is run by hand.
+ *
+ * The second half is what "never gates readiness" means when a check fails: the
+ * failure lands in the debug sink, not on the operator and not on the session's
+ * error channel. Awaited through the sink rather than after a delay, because the
+ * sink is the signal the code already exposes.
+ */
+test("the deferred checks are scheduled rather than run, and a failure stays in the log", async () => {
+  const scheduled: { callback: () => void; ms: number }[] = [];
+  const scheduler: Scheduler = {
+    after: (callback, ms) => {
+      scheduled.push({ callback, ms });
+      return INERT_TIMER;
+    },
+    cancel: () => {},
+  };
+
+  const notices: string[] = [];
+  const recorded = Promise.withResolvers<string>();
+  deferChecks({ host: scratch.host, target: TARGET, source: forbiddenSource }, scheduler, {
+    notify: (message) => notices.push(message),
+    debug: (message) => recorded.resolve(message),
+  });
+
+  // Nothing has run: the source that would have thrown was never consulted.
+  expect(scheduled).toHaveLength(1);
+  const deferred = scheduled[0];
+  expect(deferred?.ms).toBe(CHECK_DELAY_MS);
+
+  deferred?.callback();
+
+  expect(await recorded.promise).toContain("the network was reached");
+  expect(notices).toEqual([]);
 });
 
 /** The probe every status test that is not about index state passes. */

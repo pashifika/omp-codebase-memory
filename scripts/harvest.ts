@@ -13,14 +13,27 @@
  * `--stop-sessions` accepts that `install` will close every CBM session on this
  * machine. Without it the harvest refuses while a daemon is active, because
  * regenerating documentation should not take an editor's MCP connection with it.
+ * The refusal is decided here rather than inside `collect`, because the
+ * `--clients` vocabulary probe is an `install` invocation too and runs first.
+ *
+ * A failed run can leave the generated tree deleted rather than stale: the owned
+ * directories are removed before the first artifact is written. That exposure is
+ * accepted rather than closed. Everything that can refuse -- resolution, the
+ * version read, the daemon guard, the vocabulary check, `install`, and every
+ * transform with its own guards -- has already succeeded by then, so what
+ * remains is a filesystem error against a tree that is committed, and the
+ * recovery is `git checkout --` on three paths. Writing to a scratch tree and
+ * swapping it in would trade one recoverable window for three directory renames
+ * that can half-succeed and for a code path nothing exercises.
  */
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 import { readVersion } from "../src/exec.ts";
-import { collect, OVERRIDE_FLAG, SOURCE_CLIENTS } from "../src/harvest/collect.ts";
+import { collect, daemonState, SOURCE_CLIENTS } from "../src/harvest/collect.ts";
+import { daemonRefusal, OVERRIDE_FLAG, overrideReport, requireClients } from "../src/harvest/guards.ts";
 import { AGENTS_DIR, HarvestError, transformAgent, transformRule, transformSkill } from "../src/harvest/transform.ts";
-import { clientVocabulary, requireClients } from "../src/harvest/vocabulary.ts";
+import { clientVocabulary } from "../src/harvest/vocabulary.ts";
 import { processHost } from "../src/paths.ts";
 import { resolveExecutable } from "../src/resolve.ts";
 import { readState } from "../src/state.ts";
@@ -68,12 +81,27 @@ async function main(argv: readonly string[]): Promise<void> {
     throw new HarvestError(`${executable} would not report a version, so nothing can be attributed to it`);
   }
 
+  // Before the `--clients` probe rather than after it: that probe is an
+  // `install` invocation too, and `install` is what drains active CBM sessions.
+  // Read once and decided once, so the operator is never told about one
+  // observation and then made to live with a second.
+  const daemon = await daemonState(executable);
+  const refusal = daemonRefusal(daemon, stopSessions);
+  if (refusal !== null) throw new HarvestError(refusal);
+  // The override's consequence, reported rather than left to be inferred. The
+  // wording is decided in `guards.ts`, where a unit test can read it -- this
+  // file top-level-awaits a real executable and the unit suite bans it by path,
+  // so a message written inline here is a message nothing can assert. What is
+  // decided here is only that it is printed, and printed before `install` runs.
+  const report = overrideReport(daemon);
+  if (report !== null) console.warn(`harvest: ${report}`);
+
   // Verified against the executable rather than assumed: the `--clients`
   // vocabulary differs between releases, and an unknown token makes `install`
   // print the vocabulary and configure nothing.
   requireClients(await clientVocabulary(executable), SOURCE_CLIENTS, reportedVersion);
 
-  const emitted = await collect(executable, { stopSessions });
+  const emitted = await collect(executable);
   const artifacts: Artifact[] = [
     transformSkill(emitted.skill),
     transformRule(emitted.rule),

@@ -98,24 +98,52 @@ export function parseDocument(text: string): Document {
   return { keys, values, body: lines.slice(close + 1).join("\n") };
 }
 
+/** Whether `text` is a quoted scalar whose quoting is closed, so everything between the quotes is literal. */
+function isQuoted(text: string): boolean {
+  const first = text[0];
+  return (first === '"' || first === "'") && text.length > 1 && text.endsWith(first);
+}
+
+/**
+ * `text` with a trailing comment removed.
+ *
+ * {@link parseDocument} records the raw remainder of a key's line, comment
+ * included, and a `#` that follows whitespace or opens the line starts a
+ * comment in every YAML reader. Inside quoting it does not, so a closed quoted
+ * scalar is returned untouched and a `description: "issue #12 is fixed"` keeps
+ * its `#`; a comment written after the closing quote is still dropped.
+ *
+ * No value any call site reads carries a `#` on this tree -- measured over the
+ * recorded fixtures and the committed artifacts, all thirteen -- so this
+ * changes nothing the pipeline currently emits. It exists for the one value
+ * that is not carried but judged: `alwaysApply: true # keep` is boolean true to
+ * a reader and was, until this trim, allowed straight through the guard that
+ * exists to refuse exactly that key.
+ */
+function uncommented(text: string): string {
+  if (isQuoted(text)) return text;
+  const comment = /(?:^|\s)#/u.exec(text);
+  return comment === null ? text : text.slice(0, comment.index).trimEnd();
+}
+
 /**
  * One frontmatter value as a scalar string, or `null` when the key is absent.
  *
  * Unwraps the quoting CBM emits -- the skill's `description` is a double-quoted
  * scalar, the agents' are plain -- so a carried value round-trips through
- * {@link quote} unchanged in meaning.
+ * {@link quote} unchanged in meaning, and drops the comment
+ * {@link uncommented} describes. A key whose whole value is a comment reads as
+ * absent, which is what a reader resolves it to.
  */
 export function scalar(document: Document, key: string): string | null {
   const raw = document.values.get(key);
   if (raw === undefined) return null;
-  const trimmed = raw.trim();
+  const trimmed = uncommented(raw.trim());
   if (trimmed === "") return null;
+  if (!isQuoted(trimmed)) return trimmed;
   const first = trimmed[0];
-  if ((first === '"' || first === "'") && trimmed.length > 1 && trimmed.endsWith(first)) {
-    const inner = trimmed.slice(1, -1);
-    return first === '"' ? inner.replace(/\\"/gu, '"').replace(/\\\\/gu, "\\") : inner.replace(/''/gu, "'");
-  }
-  return trimmed;
+  const inner = trimmed.slice(1, -1);
+  return first === '"' ? inner.replace(/\\"/gu, '"').replace(/\\\\/gu, "\\") : inner.replace(/''/gu, "'");
 }
 
 /**
@@ -192,6 +220,34 @@ const BUNDLED_AGENT_NAMES: Readonly<Record<string, true>> = {
 };
 
 /**
+ * The spellings of boolean true this guard recognises.
+ *
+ * YAML 1.1 spells it `y`, `yes`, `on`, and `true`, in any case, and `1` reads as
+ * true to anything that coerces. A quoted `"true"` is a string to a strict
+ * parser and true to a lenient one, and {@link scalar} has unwrapped the
+ * quoting -- and dropped a trailing comment, so `true # keep` is recognised
+ * too -- by the time this is consulted. The guard that uses it defends a
+ * deliberate reversal, so it recognises every spelling rather than the single
+ * one this pipeline happens not to emit.
+ *
+ * One form is knowingly left out, and the reach claimed here stops short of it:
+ * an explicitly tagged `!!bool true`, which {@link scalar} returns whole and no
+ * entry below matches, so the guard allows it. Recognising it means resolving
+ * YAML tags, which is the parser this module is deliberately not, and the shape
+ * does not arise -- no CBM release emits `alwaysApply` at all, so every way the
+ * key can come back is written by hand, and a hand edit reinstating it spells
+ * it `true`, or `true` with a comment saying why. That is the form the trim
+ * closed; a tag is a form nobody writes by accident.
+ */
+const TRUE_SPELLINGS: Readonly<Record<string, true>> = {
+  "1": true,
+  on: true,
+  true: true,
+  y: true,
+  yes: true,
+};
+
+/**
  * The native tools the shipped agents declare, as a plain comma-separated
  * value.
  *
@@ -203,13 +259,13 @@ const BUNDLED_AGENT_NAMES: Readonly<Record<string, true>> = {
  */
 export const AGENT_TOOLS = "read, grep, glob";
 
+/** The rule's name, fixed so a CBM-written native rule shadows it rather than doubling it. */
+const RULE_NAME = "codebase-memory";
+
 /** Where each shipped surface lives, relative to the package root. */
 export const SKILL_PATH = "skills/codebase-memory/SKILL.md";
-export const RULE_PATH = "rules/codebase-memory.md";
+export const RULE_PATH = `rules/${RULE_NAME}.md`;
 export const AGENTS_DIR = "agents";
-
-/** The rule's name, fixed so a CBM-written native rule shadows it rather than doubling it. */
-export const RULE_NAME = "codebase-memory";
 
 /**
  * The skill, carrying the emitted body verbatim.
@@ -281,8 +337,19 @@ export function transformRule(source: string): Artifact {
         "the rule transform assumes a bare body",
     );
   }
+  if (source.split("\n", 1)[0]?.trimEnd() === DELIMITER) {
+    // The same failure, with no key to name it by. A leading `---` that is a
+    // thematic break rather than frontmatter still parses as an opening
+    // delimiter, and {@link parseDocument} records a key only for a line that
+    // matches `key:`, so prose between two breaks yields no keys at all -- past
+    // the check above, and outside the body this transform carries.
+    throw new HarvestError(
+      `${RULE_PATH}: the emitted instructions file opens with \`${DELIMITER}\`, which parses as a frontmatter ` +
+        `delimiter and swallows everything up to the next \`${DELIMITER}\`; the rule transform assumes a bare body`,
+    );
+  }
 
-  const description = describe(source);
+  const description = describe(document.body);
   if (description === null) {
     throw new HarvestError(`${RULE_PATH}: no prose line in the emitted instructions body to derive a description from`);
   }
@@ -290,7 +357,7 @@ export function transformRule(source: string): Artifact {
   const artifact: Artifact = {
     kind: "rule",
     path: RULE_PATH,
-    content: withFrontmatter([["description", quote(description)]], source),
+    content: withFrontmatter([["description", quote(description)]], document.body),
   };
   guardArtifact(artifact);
   return artifact;
@@ -397,11 +464,12 @@ export function guardArtifact(artifact: Artifact): void {
             "listed, and is not addressable through `rule://`",
         );
       }
-      if (document.values.get("alwaysApply")?.trim() === "true") {
+      const alwaysApply = scalar(document, "alwaysApply");
+      if (alwaysApply !== null && TRUE_SPELLINGS[alwaysApply.toLowerCase()] === true) {
         throw new HarvestError(
-          `${path}: \`alwaysApply: true\` injects the whole body every turn, where its instruction to always ` +
-            "prefer graph tools over grep/glob/file-search contradicts OMP's own `lsp` and `grep` policy and " +
-            "restates the `instructions` CBM's MCP entry already delivers per session; this rule ships as " +
+          `${path}: \`alwaysApply: ${alwaysApply}\` injects the whole body every turn, where its instruction to ` +
+            "always prefer graph tools over grep/glob/file-search contradicts OMP's own `lsp` and `grep` policy " +
+            "and restates the `instructions` CBM's MCP entry already delivers per session; this rule ships as " +
             "rulebook-only",
         );
       }
@@ -417,6 +485,14 @@ export function guardArtifact(artifact: Artifact): void {
     case "agent": {
       const name = scalar(document, "name");
       if (name === null) throw new HarvestError(`${path}: an agent with no \`name\` cannot be dispatched`);
+      const depth = path.split("/").length;
+      if (depth !== 2 || !path.startsWith(`${AGENTS_DIR}/`) || !path.endsWith(".md")) {
+        throw new HarvestError(
+          `${path}: an agent must be a single \`.md\` file directly under \`${AGENTS_DIR}/\`; the path is built ` +
+            "from the emitted `name`, so anything else is a name that leaves the directory this pipeline owns " +
+            "and cleans up",
+        );
+      }
       if (scalar(document, "description") === null) {
         throw new HarvestError(`${path}: agent \`${name}\` carries no \`description\``);
       }

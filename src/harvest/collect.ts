@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { run } from "../exec.ts";
 
+import { classifyDaemonStatus, type DaemonState } from "./guards.ts";
 import { HarvestError } from "./transform.ts";
 
 /**
@@ -12,7 +13,12 @@ import { HarvestError } from "./transform.ts";
  * `install` is CBM's activation path, not a harmless read: it drains active CBM
  * sessions before configuring, and it writes agent configuration into `HOME`. So
  * everything here is about containment -- a temporary `HOME`, an isolated cache
- * root, an explicit client list, and a refusal when a daemon is running.
+ * root, and an explicit client list.
+ *
+ * The daemon refusal is not here. It has to be decided before the `--clients`
+ * vocabulary probe, which is itself an `install` invocation, so it is decided
+ * once by the pipeline entry point and this module is only ever reached after
+ * it passed. See {@link collect}.
  */
 
 /**
@@ -56,54 +62,16 @@ const AGENT_SOURCES = [
   "codebase-memory-auditor.md",
 ] as const;
 
-/** Whether a CBM daemon is running, or that the question could not be answered. */
-export type DaemonState = "active" | "inactive" | "unknown";
-
-/** The line `daemon status` prints when nothing is running. */
-const NOT_RUNNING = "daemon: not running";
-
 /**
  * What `daemon status` reports.
  *
- * Anything that is not an explicit "not running" is {@link DaemonState.unknown}
- * rather than inactive, so a changed output shape cannot be read as permission
- * to stop the operator's sessions.
+ * The reading of the output is {@link classifyDaemonStatus}, which is pure and
+ * therefore testable; this is only the part that needs the executable.
  */
 export async function daemonState(executable: string): Promise<DaemonState> {
   const status = await run([executable, "daemon", "status"], { timeoutMs: 30_000 });
   if (!status.ok || status.spawnError !== undefined) return "unknown";
-  const reported = `${status.stdout}${status.stderr}`;
-  if (reported.includes(NOT_RUNNING)) return "inactive";
-  if (reported.includes("daemon: active")) return "active";
-  return "unknown";
-}
-
-/** The flag that overrides the daemon refusal, named in the refusal itself. */
-export const OVERRIDE_FLAG = "--stop-sessions";
-
-/**
- * The refusal a daemon state earns, or `null` when the harvest may proceed.
- *
- * The refusal is the default and proceeding must be asked for, because the
- * consequence lands outside this repository: a contributor running the harvest
- * would close whatever CBM sessions their editors currently hold, as a side
- * effect of regenerating documentation.
- */
-export function daemonRefusal(state: DaemonState): string | null {
-  switch (state) {
-    case "inactive":
-      return null;
-    case "active":
-      return (
-        "a CBM daemon is active, and `install` drains active CBM sessions before configuring, so running the " +
-        `harvest now would stop every CBM session on this machine. Close them, or pass ${OVERRIDE_FLAG} to accept it.`
-      );
-    case "unknown":
-      return (
-        "the CBM daemon status could not be determined, which is treated as active: `install` drains active CBM " +
-        `sessions before configuring. Pass ${OVERRIDE_FLAG} to proceed anyway.`
-      );
-  }
+  return classifyDaemonStatus(`${status.stdout}${status.stderr}`);
 }
 
 /** The emitted content each shipped artifact is derived from. */
@@ -114,13 +82,6 @@ export interface EmittedSources {
   readonly rule: string;
   /** Each emitted parent-handoff agent, in {@link AGENT_SOURCES} order. */
   readonly agents: readonly string[];
-  /** What `install` printed, for the provenance record and for a failure report. */
-  readonly transcript: string;
-}
-
-export interface CollectOptions {
-  /** Proceed even though a daemon is active or its state is unknown. */
-  readonly stopSessions?: boolean;
 }
 
 /**
@@ -133,12 +94,15 @@ export interface CollectOptions {
  * `--clients` is always explicit. Omitting it configures every client detected
  * on the host running the harvest, which on a contributor's machine is their
  * real editors.
+ *
+ * The daemon refusal is the caller's, and this function does not re-query it.
+ * `install` drains active CBM sessions, so the decision has to be made before
+ * the first invocation of it -- which is the `--clients` vocabulary probe in
+ * `vocabulary.ts`, not this one. A second query here would also be a second
+ * observation, and it could disagree with the state the operator was told about
+ * and consented to. `scripts/harvest.ts` decides it once, for both.
  */
-export async function collect(executable: string, options: CollectOptions = {}): Promise<EmittedSources> {
-  const state = await daemonState(executable);
-  const refusal = daemonRefusal(state);
-  if (refusal !== null && options.stopSessions !== true) throw new HarvestError(refusal);
-
+export async function collect(executable: string): Promise<EmittedSources> {
   const home = await mkdtemp(path.join(tmpdir(), "cbm-harvest-"));
   try {
     for (const directory of DETECTION_DIRS) {
@@ -165,16 +129,17 @@ export async function collect(executable: string, options: CollectOptions = {}):
         // an ordinary `cli` command in the same situation is -- outright, with
         // `CBM could not start because the active account daemon uses a
         // different cache directory`. A real run went through, and the daemon
-        // came back under a new pid, which is the drain this guard exists to
-        // make deliberate. So the isolation rests on the daemon guard above and
-        // on `HOME`, never on CBM declining. The indexed projects survived it:
-        // the graph is in the cache, not in the process.
+        // came back under a new pid, which is the drain the pipeline's daemon
+        // guard exists to make deliberate. So the isolation rests on that guard
+        // -- decided once in `scripts/harvest.ts`, before the first invocation
+        // of `install` -- and on `HOME`, never on CBM declining. The indexed
+        // projects survived it: the graph is in the cache, not in the process.
         env: { HOME: home, CBM_CACHE_DIR: path.join(home, "cache") },
       },
     );
 
-    const transcript = `${install.stdout}${install.stderr}`.trim();
     if (!install.ok) {
+      const transcript = `${install.stdout}${install.stderr}`.trim();
       throw new HarvestError(
         `\`install\` failed with exit ${install.exitCode}` +
           `${install.spawnError === undefined ? "" : ` (${install.spawnError})`}: ${transcript}`,
@@ -196,9 +161,9 @@ export async function collect(executable: string, options: CollectOptions = {}):
       AGENT_SOURCES.map(async (name) => await readEmitted(home, `${AGENTS_SOURCE_DIR}/${name}`)),
     );
 
-    return { skill, rule, agents, transcript };
+    return { skill, rule, agents };
   } finally {
-    // Including on failure: a refusal above must not be the reason a scratch
+    // Including on failure: a failed run must not be the reason a scratch
     // machine's configuration outlives the process that made it.
     await rm(home, { recursive: true, force: true });
   }

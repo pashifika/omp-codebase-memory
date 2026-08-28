@@ -11,10 +11,13 @@ import type { GraphClient } from "./graph.ts";
  * identity CBM already records -- a walk-up can also land on a root CBM never
  * indexed, which is a name every query would then reject.
  *
- * Resolved once per session and reused. The working directory does not change
- * mid-session in a way that would move the project, and paying a graph query per
- * `grep` to re-derive a constant is exactly the cost the augmentation's deadline
- * exists to bound.
+ * A definitive answer is resolved once per resolver and reused; a resolver that
+ * could not reach the graph keeps asking, for the reason `projectResolver`
+ * below gives. Each feature entry holds its own resolver, so what they share is
+ * the selection rule rather than one resolution. The working directory does not
+ * change mid-session in a way that would move the project, and paying a graph
+ * query per `grep` to re-derive a constant is exactly the cost the
+ * augmentation's deadline exists to bound.
  */
 
 /** One indexed project, as `list_projects` records it. */
