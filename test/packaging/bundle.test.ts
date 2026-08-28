@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { copyFile, mkdtemp, readdir } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -32,16 +32,40 @@ async function declaredEntries(): Promise<readonly string[]> {
 /**
  * Loads the bundle from a directory holding nothing else.
  *
- * The isolation is the point: a bundle that had quietly kept a runtime
- * dependency would fail to import rather than resolve it from this
- * repository's own `node_modules`.
+ * The isolation is the point, and it has two halves. The module half: a bundle
+ * that had quietly kept a runtime dependency would fail to import rather than
+ * resolve it from this repository's own `node_modules`. The environment half:
+ * loading *runs* the factory, which stands down when
+ * `<agent-dir>/extensions/codebase-memory.ts` exists, so against the
+ * developer's real agent directory every assertion below is decided by state
+ * outside this repository -- and would go red the day upstream ships the
+ * native extension that guard exists to detect, for a reason having nothing to
+ * do with the bundle. The scratch directory is the agent directory too; it
+ * holds `index.js` and nothing else, which is what the assertion below proves.
  */
 async function loadIsolated(): Promise<LoadExtensionsResult> {
   const directory = await mkdtemp(join(tmpdir(), "cbm-bundle-"));
-  const copied = join(directory, "index.js");
-  await copyFile(resolve(BUNDLE), copied);
-  expect(await readdir(directory)).toEqual(["index.js"]);
-  return await loadExtensions([copied], directory);
+  const previousAgentDir = process.env["PI_CODING_AGENT_DIR"];
+  try {
+    const copied = join(directory, "index.js");
+    await copyFile(resolve(BUNDLE), copied);
+    expect(await readdir(directory)).toEqual(["index.js"]);
+
+    process.env["PI_CODING_AGENT_DIR"] = directory;
+    return await loadExtensions([copied], directory);
+  } finally {
+    // Restored, not deleted: an unset variable and one set to something else
+    // are different environments, and the suite has no licence to change which
+    // one the tests after it run in.
+    if (previousAgentDir === undefined) {
+      delete process.env["PI_CODING_AGENT_DIR"];
+    } else {
+      process.env["PI_CODING_AGENT_DIR"] = previousAgentDir;
+    }
+    // The loaded module is already in memory, so the copy on disk has no
+    // reader left. Every call here makes a directory; none of them outlive it.
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 describe("the declared extension entries", () => {
@@ -86,11 +110,14 @@ describe("the standalone bundle", () => {
    * handler as a refusal of the tool call, so a handler registered here could
    * deny an operator's `grep` because a subprocess timed out. The event is not
    * registered at all, and this is the assertion that keeps it that way.
+   *
+   * Asserted as the whole registered set rather than as
+   * `not.toContain("tool_call")`: that form also passes on an *empty* handler
+   * list, so it would report success for a factory that registered nothing.
    */
   test("registers no tool_call handler", async () => {
     const loaded = await loadIsolated();
     const handlers = [...(loaded.extensions[0]?.handlers.keys() ?? [])];
-    expect(handlers).not.toContain("tool_call");
     expect(handlers.sort()).toEqual(["session_start"]);
   });
 });
