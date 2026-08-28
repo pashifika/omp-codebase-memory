@@ -1,0 +1,29 @@
+{
+  "name": "omp-codebase-memory",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "OMP extension that owns the codebase-memory-mcp executable lifecycle and wires exactly one MCP server entry into OMP's native user configuration.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pashifika/omp-codebase-memory.git"
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --target=bun --format=esm --outfile=dist/index.js",
+    "test": "bun test",
+    "test:unit": "bun test test/unit",
+    "test:packaging": "bun run build && bun test test/packaging",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.0.8",
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}

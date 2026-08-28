@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # A tag is a claim about four things: the tag itself, the package manifest
+  # version, the catalog plugin version, and the catalog's source ref. An
+  # operator installing from the marketplace resolves the last one, so a catalog
+  # that lags the tag installs the previous release under the new version's
+  # name. Publish only if all four agree.
+  version-gate:
+    name: version gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Tag, manifest and catalog must name one version
+        timeout-minutes: 5
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          manifest="$(jq -r '.version' package.json)"
+          catalog="$(jq -r '.plugins[0].version' .omp-plugin/marketplace.json)"
+          catalog_ref="$(jq -r '.plugins[0].source.ref' .omp-plugin/marketplace.json)"
+
+          printf 'tag=%s\nmanifest=%s\ncatalog=%s\ncatalog_ref=%s\n' \
+            "$TAG" "$manifest" "$catalog" "$catalog_ref"
+
+          fail=0
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::package.json version $manifest does not match tag $TAG"
+            fail=1
+          fi
+          if [ "$catalog" != "$version" ]; then
+            echo "::error::catalog plugin version $catalog does not match tag $TAG"
+            fail=1
+          fi
+          if [ "$catalog_ref" != "$TAG" ]; then
+            echo "::error::catalog source.ref $catalog_ref does not match tag $TAG"
+            fail=1
+          fi
+          exit "$fail"
+
+  # The same gate a pull request passes, not a copy of it. `ci.yml` declares
+  # `workflow_call` for exactly this.
+  checks:
+    name: checks
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [version-gate, checks]
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tagged tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        # This is the one job that elevates to `contents: write`, so it is the
+        # one job where a persisted credential matters: `actions/checkout`
+        # otherwise writes an `AUTHORIZATION: basic <token>` extraheader into
+        # `.git/config` and leaves a push-capable credential on disk for every
+        # later step. Nothing here needs it -- `gh release create` authenticates
+        # through `GH_TOKEN` below, not through the git remote.
+        with:
+          persist-credentials: false
+
+      - name: Create the GitHub release
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `--verify-tag` refuses to create a release for a tag that does not
+        # exist on the remote, so a release can only ever name a verified ref.
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag

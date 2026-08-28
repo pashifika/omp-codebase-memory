@@ -1,0 +1,26 @@
+{
+  "name": "omp-codebase-memory",
+  "owner": {
+    "name": "pashifika"
+  },
+  "metadata": {
+    "description": "OMP-native wiring for codebase-memory-mcp"
+  },
+  "plugins": [
+    {
+      "name": "omp-codebase-memory",
+      "description": "Owns the codebase-memory-mcp executable lifecycle -- verified download, version tracking, pinning -- and wires exactly one MCP server entry into OMP's native user configuration. Adopts an existing system installation rather than replacing it.",
+      "version": "0.1.0",
+      "source": {
+        "source": "github",
+        "repo": "pashifika/omp-codebase-memory",
+        "ref": "v0.1.0"
+      },
+      "category": "productivity",
+      "homepage": "https://github.com/pashifika/omp-codebase-memory",
+      "repository": "https://github.com/pashifika/omp-codebase-memory",
+      "license": "MIT",
+      "tags": ["mcp", "codebase-memory", "knowledge-graph", "installer"]
+    }
+  ]
+}

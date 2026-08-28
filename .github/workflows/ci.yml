@@ -1,0 +1,347 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # Reused by `release.yml`, so a tag passes the same gate a pull request does
+  # rather than a copy of it that can drift.
+  workflow_call:
+
+# Least privilege: nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+# One in-flight run per pull request, or per ref outside one. A newer push
+# supersedes and cancels the run it replaces.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runtime job. Verifies the workflows themselves, because an unpinned action
+  # reference is a supply-chain hole that no other job in this repository looks
+  # at, and reviewing for it by eye is exactly the check that stops happening.
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the workflow tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Verify every action reference is SHA-pinned with a version comment
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(
+            find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort
+          )
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "hygiene: no workflow files under .github/workflows; this check would verify nothing"
+            exit 1
+          fi
+
+          echo "hygiene: scanning ${#files[@]} workflow file(s)"
+          printf '  %s\n' "${files[@]}"
+
+          awk '
+          BEGIN {
+            checked = 0
+            violations = 0
+            sq = sprintf("%c", 39)
+          }
+          {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+
+            # A commented-out example is documentation, not a live reference.
+            if (line ~ /^#/) next
+
+            sub(/^-[[:space:]]+/, "", line)
+            if (line !~ /^uses:[[:space:]]*/) next
+            sub(/^uses:[[:space:]]*/, "", line)
+
+            # Separate the trailing version comment from the reference itself.
+            comment = ""
+            hash = index(line, "#")
+            if (hash > 0) {
+              comment = substr(line, hash + 1)
+              line = substr(line, 1, hash - 1)
+            }
+            sub(/[[:space:]]+$/, "", line)
+            sub(/^[[:space:]]+/, "", comment)
+            sub(/[[:space:]]+$/, "", comment)
+
+            ref = line
+            if (length(ref) > 1) {
+              first = substr(ref, 1, 1)
+              last = substr(ref, length(ref), 1)
+              if ((first == "\"" && last == "\"") || (first == sq && last == sq))
+                ref = substr(ref, 2, length(ref) - 2)
+            }
+            if (ref == "") next
+
+            # A local reusable workflow is this repository, already at this SHA.
+            if (ref ~ /^\.\//) next
+
+            checked++
+
+            # Action references carry exactly one "@"; scan from the right so a
+            # reusable-workflow path never confuses the split.
+            at = 0
+            for (i = length(ref); i > 0; i--)
+              if (substr(ref, i, 1) == "@") { at = i; break }
+
+            if (at == 0) {
+              printf "  FAIL %s:%d %s -- not pinned to a commit SHA\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            sha = substr(ref, at + 1)
+            if (sha !~ /^[0-9a-f]{40}$/) {
+              printf "  FAIL %s:%d %s -- not pinned to a full 40-character commit SHA\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            if (comment == "") {
+              printf "  FAIL %s:%d %s -- SHA pin carries no trailing version comment\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            printf "  ok   %s:%d %s (%s)\n", FILENAME, FNR, ref, comment
+          }
+          END {
+            if (checked == 0) {
+              print "hygiene: no uses: references found; this check would verify nothing"
+              exit 1
+            }
+            if (violations > 0) {
+              printf "hygiene: %d of %d reference(s) rejected; every uses: must read owner/repo@<40-hex-sha> # <version>\n", violations, checked
+              exit 1
+            }
+            printf "hygiene: %d reference(s) checked, all SHA-pinned with a version comment\n", checked
+          }
+          ' "${files[@]}"
+
+  # Runtime job. Bun only, deliberately: this package targets OMP's runtime and
+  # has no npm runtime dependencies, so a Node job would assert a compatibility
+  # nobody consumes.
+  bun:
+    name: bun
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Bun toolchain
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        timeout-minutes: 5
+        with:
+          # Pinned, not `latest`: a runtime that changes underneath a previously
+          # green build makes a red one unexplainable. Bump deliberately, in
+          # step with `@types/bun` in `package.json` -- that package supplies
+          # every runtime type this code uses, so the two move together.
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        # `--frozen-lockfile` is the point of committing `bun.lock`: a
+        # dependency resolving differently in CI than locally is a failure, not
+        # an update to perform silently.
+        run: bun install --frozen-lockfile
+
+      - name: Report the toolchain versions
+        timeout-minutes: 5
+        # Printed, not assumed: every result below belongs to these versions.
+        run: |
+          bun --version
+          bunx tsc --version
+          tar --version | head -n 1
+
+      - name: Type-check
+        timeout-minutes: 5
+        # Through the package scripts, not the underlying commands: a flag that
+        # lives in only one of the two places is a difference between what a
+        # contributor runs and what the gate runs.
+        run: bun run typecheck
+
+      - name: Unit tests
+        timeout-minutes: 10
+        run: bun run test:unit
+
+      - name: Build and load the standalone extension bundle
+        timeout-minutes: 5
+        run: bun run test:packaging
+
+      # `test:packaging` rebuilds `dist/index.js` before loading it, so a green
+      # packaging step proves that a fresh bundle builds and registers what it
+      # claims -- never that the committed one matches the source beside it. The
+      # README tells an operator to load the committed file directly after
+      # `git clone` with no build step, so without this a pull request carrying
+      # an innocuous source diff and a substituted bundle would merge green.
+      - name: Verify the committed bundle matches the one built from source
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # A pathspec matching nothing makes `git diff` exit 0, so the path is
+          # confirmed tracked before its diff is trusted.
+          git ls-files --error-unmatch dist/index.js
+          git diff --exit-code -- dist/index.js
+
+  # Runtime job. Runs the two install commands the README documents, through
+  # OMP's own CLI, so the documented path and the verified path are one path.
+  # `omp plugin install` is strictly more than a `bun add`: after resolving the
+  # spec it runs `#validateInstalledExtensions`, which loads every declared
+  # entry against a throwaway registration surface and therefore invokes the
+  # factory. `omp plugin link` registers a checkout without loading it, so that
+  # half is discovery only -- that the committed bundle loads clean through
+  # OMP's loader is `test/packaging/bundle.test.ts`.
+  #
+  # Not a pull-request job: it installs by ref, and a pull request's merge ref
+  # does not exist on the remote as an installable ref. It therefore runs on
+  # manual dispatch and on pushes, which includes the tag push that publishes a
+  # release, so the documented command is verified against the exact ref an
+  # operator can install. It is deliberately absent from `ci`'s `needs`: a
+  # skipped job would otherwise fail the required check on every pull request.
+  install-check:
+    name: install check
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Bun toolchain
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        timeout-minutes: 5
+        with:
+          bun-version: 1.3.14
+
+      - name: Install the OMP CLI this package is developed against
+        timeout-minutes: 5
+        # Read out of `devDependencies` rather than written again here: the CLI
+        # that validates the install has to be the one the suite type-checks and
+        # loads against, and a second copy of the version drifts.
+        run: |
+          set -euo pipefail
+
+          version="$(jq -r '.devDependencies["@oh-my-pi/pi-coding-agent"] // empty' package.json)"
+          case "$version" in
+            "")
+              echo "::error::package.json declares no @oh-my-pi/pi-coding-agent devDependency to pin the OMP CLI to"
+              exit 1
+              ;;
+            # A range would resolve to whatever is newest at job time, which is the
+            # drift this step reads the manifest to avoid. Only an exact pin will do.
+            # This arm comes first because the accepting pattern below ends in an
+            # unanchored `*`: without it `18.0.8 || 19.0.0` matches on its prefix.
+            *[[:space:]]*|*"|"*)
+              echo "::error::@oh-my-pi/pi-coding-agent is declared as '$version'; the OMP CLI must be pinned to an exact version, not a range"
+              exit 1
+              ;;
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::@oh-my-pi/pi-coding-agent is declared as '$version'; the OMP CLI must be pinned to an exact version, not a range"
+              exit 1
+              ;;
+          esac
+
+          echo "installing OMP CLI $version"
+          bun add --global "@oh-my-pi/pi-coding-agent@$version"
+          omp --version
+
+      - name: Install the documented git spec on a machine with no prior state
+        timeout-minutes: 10
+        env:
+          SPEC: github:${{ github.repository }}#${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # A scratch HOME, not the runner's. The installer keeps its plugin
+          # registry under `$HOME/.omp`, and "resolves on a clean machine" is
+          # only a claim about a machine that holds none of it yet.
+          HOME="$(mktemp -d)"
+          export HOME
+
+          echo "installing $SPEC"
+          omp plugin install "$SPEC"
+
+          # `install` already fails loudly on a spec that will not resolve or an
+          # entry that will not load; this is the discovery half, that the
+          # plugin is registered under the name its manifest declares.
+          omp plugin list > "$HOME/plugins.txt"
+          cat "$HOME/plugins.txt"
+          grep -q 'omp-codebase-memory' "$HOME/plugins.txt"
+
+      - name: Link this checkout the way the development install documents
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          # Its own scratch HOME. `link` and `install` register the same package
+          # name, so linking a checkout on top of the git-spec install above
+          # collides on the plugin's `node_modules` entry -- two documented
+          # commands, two clean machines.
+          HOME="$(mktemp -d)"
+          export HOME
+
+          omp plugin link .
+          omp plugin list > "$HOME/plugins.txt"
+          cat "$HOME/plugins.txt"
+          grep -q 'omp-codebase-memory' "$HOME/plugins.txt"
+
+  # The single status check branch protection requires. Runtime jobs are never
+  # named there, so changing the matrix never means editing the ruleset.
+  ci:
+    name: ci
+    needs: [hygiene, bun]
+    # `always()` is load-bearing. Without it this job is skipped when a
+    # dependency fails, and a skipped required check blocks a pull request
+    # rather than failing it -- a stuck merge button instead of a red one.
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every runtime job to succeed
+        timeout-minutes: 5
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+
+          count=$(jq 'length' <<< "$RESULTS")
+          if [ "$count" -eq 0 ]; then
+            echo "ci: no aggregated jobs; the gate would report success while verifying nothing"
+            exit 1
+          fi
+
+          echo "ci: aggregating $count job result(s)"
+          jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<< "$RESULTS"
+
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<< "$RESULTS")
+          if [ -n "$failed" ]; then
+            echo "ci: gate failed; these jobs did not succeed:"
+            printf '  %s\n' $failed
+            exit 1
+          fi
+
+          echo "ci: all $count job(s) succeeded"
