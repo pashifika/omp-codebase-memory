@@ -94,6 +94,12 @@ function managedBinRoot(host) {
 function managedExecutable(host, version) {
   return path.join(managedBinRoot(host), version, EXECUTABLE_NAME);
 }
+function insideManagedBinRoot(host, candidate) {
+  if (!path.isAbsolute(candidate))
+    return false;
+  const inside = path.relative(managedBinRoot(host), candidate);
+  return inside !== "" && !inside.startsWith("..") && !path.isAbsolute(inside);
+}
 function statePath(host) {
   return path.join(packageRoot(host), "state.json");
 }
@@ -252,7 +258,7 @@ function schedulerFrom(ctx) {
 }
 
 // src/lifecycle.ts
-import { rm as rm2 } from "fs/promises";
+import { rm as rm4 } from "fs/promises";
 
 // src/acquire.ts
 import { chmod, lstat, mkdtemp, mkdir, rename, rm } from "fs/promises";
@@ -529,7 +535,8 @@ async function adopt(host, candidate) {
 }
 
 // src/mcp-config.ts
-import { mkdir as mkdir2 } from "fs/promises";
+import { randomUUID } from "crypto";
+import { chmod as chmod2, mkdir as mkdir2, rename as rename2, rm as rm2, stat } from "fs/promises";
 import path3 from "path";
 var MCP_SCHEMA_URL = "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json";
 async function readMcpFile(host) {
@@ -537,7 +544,14 @@ async function readMcpFile(host) {
   let text;
   try {
     text = await Bun.file(file).text();
-  } catch {
+  } catch (error) {
+    const code = error?.code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      return {
+        ok: false,
+        reason: `${file} could not be read (${code ?? "no errno"}), so it was left untouched: ` + `${error instanceof Error ? error.message : String(error)}`
+      };
+    }
     return {
       ok: true,
       file: { path: file, text: null, document: {}, indent: "  ", trailingNewline: true }
@@ -554,6 +568,14 @@ async function readMcpFile(host) {
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return { ok: false, reason: `${file} does not hold a JSON object, so it was left untouched` };
+  }
+  const servers = parsed["mcpServers"];
+  const shaped = typeof servers === "object" && servers !== null && !Array.isArray(servers);
+  if (servers !== undefined && !shaped) {
+    return {
+      ok: false,
+      reason: `${file} holds an mcpServers value that is not a JSON object, so it was left untouched`
+    };
   }
   return {
     ok: true,
@@ -576,13 +598,15 @@ async function upsertEntry(host, command, previouslyWrote) {
   const existing = servers[SERVER_NAME];
   if (existing !== undefined) {
     const currentCommand = commandOf(existing);
-    const ours = currentCommand === command || currentCommand === previouslyWrote;
+    const ours = currentCommand === command || currentCommand === previouslyWrote || currentCommand !== undefined && insideManagedBinRoot(host, currentCommand);
     if (!ours) {
       return {
         ok: false,
         reason: `${file.path} already defines ${SERVER_NAME} with command ${currentCommand ?? "(none)"}, ` + `which this package did not write. It was left untouched; the executable this package resolved is ${command}.`
       };
     }
+    if (isCurrentEntry(existing, command))
+      return { ok: true, change: "unchanged" };
   }
   const next = { ...file.document };
   if (file.text === null)
@@ -594,11 +618,8 @@ async function upsertEntry(host, command, previouslyWrote) {
     args: []
   };
   next["mcpServers"] = { ...servers, [SERVER_NAME]: entry };
-  const rendered = render(next, file);
-  if (file.text === rendered)
-    return { ok: true, change: "unchanged" };
   await mkdir2(path3.dirname(file.path), { recursive: true });
-  await Bun.write(file.path, rendered);
+  await writeDurably(file.path, render(next, file));
   return { ok: true, change: file.text === null ? "created" : "updated" };
 }
 async function removeEntry(host, wroteCommand) {
@@ -613,7 +634,8 @@ async function removeEntry(host, wroteCommand) {
   if (existing === undefined)
     return { ok: true, change: "absent" };
   const currentCommand = commandOf(existing);
-  if (wroteCommand === undefined || currentCommand !== wroteCommand) {
+  const ours = wroteCommand !== undefined && currentCommand === wroteCommand || currentCommand !== undefined && insideManagedBinRoot(host, currentCommand);
+  if (!ours) {
     return {
       ok: false,
       reason: `${file.path} defines ${SERVER_NAME} with command ${currentCommand ?? "(none)"}, ` + `which is not what this package wrote (${wroteCommand ?? "nothing recorded"}). It was left in place.`
@@ -621,8 +643,14 @@ async function removeEntry(host, wroteCommand) {
   }
   const remaining = { ...servers };
   delete remaining[SERVER_NAME];
+  const others = Object.keys(file.document).filter((key) => key !== "mcpServers");
+  const ourCreation = others.length === 1 && others[0] === "$schema" && file.document["$schema"] === MCP_SCHEMA_URL;
+  if (Object.keys(remaining).length === 0 && ourCreation) {
+    await rm2(file.path, { force: true });
+    return { ok: true, change: "removed" };
+  }
   const next = { ...file.document, mcpServers: remaining };
-  await Bun.write(file.path, render(next, file));
+  await writeDurably(file.path, render(next, file));
   return { ok: true, change: "removed" };
 }
 async function entryStatus(host, resolvedCommand) {
@@ -646,6 +674,13 @@ function serverMap(document) {
   const servers = document["mcpServers"];
   return typeof servers === "object" && servers !== null && !Array.isArray(servers) ? servers : {};
 }
+function isCurrentEntry(entry, command) {
+  if (commandOf(entry) !== command)
+    return false;
+  const record = entry;
+  const args = record["args"];
+  return record["type"] === "stdio" && Array.isArray(args) && args.length === 0;
+}
 function commandOf(entry) {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry))
     return;
@@ -661,9 +696,29 @@ function render(document, file) {
   return file.trailingNewline ? `${body}
 ` : body;
 }
+async function writeDurably(file, contents) {
+  const staging = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    let mode = 384;
+    try {
+      mode = (await stat(file)).mode & 511;
+    } catch (error) {
+      const code = error?.code;
+      if (code !== "ENOENT")
+        throw error;
+    }
+    await Bun.write(staging, contents);
+    await chmod2(staging, mode);
+    await rename2(staging, file);
+  } catch (error) {
+    await rm2(staging, { force: true });
+    throw error;
+  }
+}
 
 // src/state.ts
-import { mkdir as mkdir3 } from "fs/promises";
+import { randomUUID as randomUUID2 } from "crypto";
+import { chmod as chmod3, mkdir as mkdir3, rename as rename3, rm as rm3, stat as stat2 } from "fs/promises";
 import path4 from "path";
 var EMPTY = {};
 async function readState(host) {
@@ -698,8 +753,24 @@ async function readState(host) {
 async function writeState(host, next) {
   const file = statePath(host);
   await mkdir3(path4.dirname(file), { recursive: true });
-  await Bun.write(file, `${JSON.stringify(next, null, 2)}
+  const staging = `${file}.${process.pid}.${randomUUID2()}.tmp`;
+  try {
+    let mode = 384;
+    try {
+      mode = (await stat2(file)).mode & 511;
+    } catch (error) {
+      const code = error?.code;
+      if (code !== "ENOENT")
+        throw error;
+    }
+    await Bun.write(staging, `${JSON.stringify(next, null, 2)}
 `);
+    await chmod3(staging, mode);
+    await rename3(staging, file);
+  } catch (error) {
+    await rm3(staging, { force: true });
+    throw error;
+  }
 }
 async function updateState(host, patch) {
   const next = { ...await readState(host), ...patch };
@@ -826,8 +897,7 @@ async function install(lifecycle, version) {
   const state = await updateState(host, {
     managedVersion: acquired.version,
     managedDigest: acquired.digest,
-    upstreamVersion: acquired.version,
-    lastCheckedAt: Date.now()
+    ...version === undefined ? { upstreamVersion: acquired.version, lastCheckedAt: Date.now() } : {}
   });
   const resolution = await resolveExecutable(host, state);
   if (!resolution.ok) {
@@ -884,10 +954,16 @@ async function uninstall(lifecycle) {
   const { host } = lifecycle;
   const state = await readState(host);
   const removal = await removeEntry(host, state.wroteCommand);
+  if (!removal.ok && await wouldDangle(host)) {
+    return {
+      ok: false,
+      message: `left the MCP entry alone: ${removal.reason} The managed copy and this package's state were ` + "kept with it, so nothing is left naming a file this command deleted. Resolve that, then run " + "/cbm uninstall again."
+    };
+  }
   const entryMessage = removal.ok ? removal.change === "removed" ? "removed the owned MCP entry" : "there was no owned MCP entry to remove" : `left the MCP entry alone: ${removal.reason}`;
   const root = packageRoot(host);
   const managed = await managedCopy(host, state);
-  await rm2(root, { recursive: true, force: true });
+  await rm4(root, { recursive: true, force: true });
   const copyMessage = managed === null ? "no managed copy was present" : `removed the managed copy of ${managed.version}`;
   const systemNote = await systemStillPresent(host);
   return { ok: true, message: `${copyMessage}, ${entryMessage}, and deleted ${root}.${systemNote}` };
@@ -914,11 +990,11 @@ async function checkUpstream(lifecycle, options = {}) {
   const { host } = lifecycle;
   const now = options.now ?? Date.now();
   const state = await readState(host);
-  const last = state.lastCheckedAt;
-  if (options.force !== true && last !== undefined && now - last < CHECK_INTERVAL_MS) {
+  const age = state.lastCheckedAt === undefined ? undefined : now - state.lastCheckedAt;
+  if (options.force !== true && age !== undefined && age >= 0 && age < CHECK_INTERVAL_MS) {
     return {
       kind: "skipped",
-      message: `upstream was last checked ${Math.round((now - last) / 60000)} minutes ago; skipping.`
+      message: `upstream was last checked ${Math.round(age / 60000)} minutes ago; skipping.`
     };
   }
   let upstream;
@@ -958,6 +1034,12 @@ async function wire(lifecycle, resolved, state) {
     case "unchanged":
       return { ok: true, message: `The MCP entry already names ${resolved.executable}.` };
   }
+}
+async function wouldDangle(host) {
+  const entry = await entryStatus(host, null);
+  if (entry.problem !== undefined)
+    return true;
+  return entry.command !== undefined && insideManagedBinRoot(host, entry.command);
 }
 async function systemStillPresent(host) {
   const resolution = await resolveExecutable(host, {});

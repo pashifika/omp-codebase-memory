@@ -28,6 +28,11 @@ interface Layout {
   readonly pin?: string;
   /** A recorded pointer with no file behind it, e.g. after a manual delete. */
   readonly danglingPointer?: string;
+  /**
+   * A copy on the scratch `PATH` that runs and exits non-zero -- a stub, a
+   * half-written file, a shim -- instead of reporting a version.
+   */
+  readonly brokenOnPath?: boolean;
 }
 
 async function place(scratch: Scratch, layout: Layout): Promise<void> {
@@ -36,6 +41,9 @@ async function place(scratch: Scratch, layout: Layout): Promise<void> {
       path.join(scratch.pathDir, EXECUTABLE_NAME),
       `echo "codebase-memory-mcp ${layout.onPath}"`,
     );
+  }
+  if (layout.brokenOnPath === true) {
+    await writeFakeExecutable(path.join(scratch.pathDir, EXECUTABLE_NAME), "exit 7");
   }
   if (layout.localBin !== undefined) {
     await writeFakeExecutable(
@@ -113,6 +121,18 @@ const ordering: OrderCase[] = [
   {
     scenario: "a pin with no managed copy behind it falls through to PATH",
     layout: { onPath: "0.9.0", pin: "0.10.8" },
+    source: "system",
+    origin: "PATH",
+    executable: (scratch) => path.join(scratch.pathDir, EXECUTABLE_NAME),
+  },
+  {
+    // Resolution deliberately never runs the candidate -- see the note on
+    // `resolveExecutable`. Adopting a path that turns out not to run is the
+    // chosen trade against spawning an unknown binary on every session start,
+    // and `/cbm status` is where a candidate that will not execute becomes
+    // visible, by reading its version separately.
+    scenario: "an executable on PATH that exits non-zero is still adopted",
+    layout: { brokenOnPath: true },
     source: "system",
     origin: "PATH",
     executable: (scratch) => path.join(scratch.pathDir, EXECUTABLE_NAME),

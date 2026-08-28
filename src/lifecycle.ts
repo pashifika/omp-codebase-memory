@@ -1,7 +1,7 @@
 import { rm } from "node:fs/promises";
 
 import { acquire, normalizeVersion, type Acquired } from "./acquire.ts";
-import { agentDir, packageRoot, type Host } from "./paths.ts";
+import { agentDir, insideManagedBinRoot, packageRoot, type Host } from "./paths.ts";
 import { entryStatus, removeEntry, upsertEntry } from "./mcp-config.ts";
 import { resolvedVersion, managedCopy, resolveExecutable, type Resolved } from "./resolve.ts";
 import { readState, updateState, writeState, type State } from "./state.ts";
@@ -192,11 +192,16 @@ export async function install(lifecycle: Lifecycle, version?: string): Promise<A
     return { ok: false, message: `install failed: ${describe(error)}` };
   }
 
+  // `acquire` returns the version it was asked for, so an explicitly requested
+  // one is no answer about upstream: recording it would report an old build as
+  // the newest release and suppress the real check for a day. Only a check --
+  // or an install that had to ask what the newest release is -- establishes it.
   const state = await updateState(host, {
     managedVersion: acquired.version,
     managedDigest: acquired.digest,
-    upstreamVersion: acquired.version,
-    lastCheckedAt: Date.now(),
+    ...(version === undefined
+      ? { upstreamVersion: acquired.version, lastCheckedAt: Date.now() }
+      : {}),
   });
 
   const resolution = await resolveExecutable(host, state);
@@ -294,6 +299,21 @@ export async function uninstall(lifecycle: Lifecycle): Promise<ActionReport> {
   const state = await readState(host);
 
   const removal = await removeEntry(host, state.wroteCommand);
+  if (!removal.ok && (await wouldDangle(host))) {
+    // Only a refusal whose entry names something this command is about to
+    // delete makes deleting it harmful: OMP would spawn the removed path at
+    // every session start, and the same `rm` takes the state that says the
+    // entry was ever this package's, so the key could never be reclaimed
+    // either. Keeping both halves is recoverable; keeping only the entry is not.
+    return {
+      ok: false,
+      message:
+        `left the MCP entry alone: ${removal.reason} The managed copy and this package's state were ` +
+        "kept with it, so nothing is left naming a file this command deleted. Resolve that, then run " +
+        "/cbm uninstall again.",
+    };
+  }
+
   const entryMessage = removal.ok
     ? removal.change === "removed"
       ? "removed the owned MCP entry"
@@ -361,11 +381,16 @@ export async function checkUpstream(
   const now = options.now ?? Date.now();
   const state = await readState(host);
 
-  const last = state.lastCheckedAt;
-  if (options.force !== true && last !== undefined && now - last < CHECK_INTERVAL_MS) {
+  // Bounded on both sides, because a recorded time in the future is not "under
+  // 24 hours old": a backwards clock correction -- a restored VM snapshot, an
+  // NTP step, a host that booted with a bad RTC -- makes the age negative, and a
+  // one-sided test would then suppress the daily check for the whole skew and
+  // report a negative age to the operator.
+  const age = state.lastCheckedAt === undefined ? undefined : now - state.lastCheckedAt;
+  if (options.force !== true && age !== undefined && age >= 0 && age < CHECK_INTERVAL_MS) {
     return {
       kind: "skipped",
-      message: `upstream was last checked ${Math.round((now - last) / 60_000)} minutes ago; skipping.`,
+      message: `upstream was last checked ${Math.round(age / 60_000)} minutes ago; skipping.`,
     };
   }
 
@@ -430,6 +455,40 @@ async function wire(
     case "unchanged":
       return { ok: true, message: `The MCP entry already names ${resolved.executable}.` };
   }
+}
+
+/**
+ * Whether removing the package-owned root would leave the owned entry naming a
+ * file that no longer exists.
+ *
+ * Asked only when {@link removeEntry} refused, and it is what separates the two
+ * kinds of refusal. An entry inside the managed bin root -- or a file this
+ * package could not read structurally, where it cannot know what the entry
+ * names -- is the dangerous kind. An entry naming a system CBM is not: that
+ * entry is correctly wired to an executable uninstall never touches, so
+ * blocking on it would make the managed copy unremovable by the one command
+ * whose job is removing it.
+ *
+ * The managed-root half is unreachable through {@link removeEntry} as it stands:
+ * ownership there is decided from the path as well as from recorded state, so a
+ * readable entry naming something under the managed root is this package's and
+ * is removed rather than refused. Every refusal that reaches here today is a
+ * file-level one and answers on `problem`.
+ *
+ * It is kept anyway, because this predicate states the property it is named for
+ * rather than a fact about how `removeEntry` currently decides ownership.
+ * Dropping it would make uninstall's safety depend on an invariant that lives in
+ * another function, and a later narrowing of that ownership rule would silently
+ * reintroduce the dangling entry this guard exists to prevent -- a failure whose
+ * cost is a deleted executable OMP keeps spawning and a key that can never be
+ * reclaimed. There is deliberately no test reaching this half: one could only be
+ * written by contriving a refusal `removeEntry` does not produce, which would
+ * assert the scaffolding rather than the property.
+ */
+async function wouldDangle(host: Host): Promise<boolean> {
+  const entry = await entryStatus(host, null);
+  if (entry.problem !== undefined) return true;
+  return entry.command !== undefined && insideManagedBinRoot(host, entry.command);
 }
 
 /** A note naming an adopted system executable uninstall deliberately left alone. */

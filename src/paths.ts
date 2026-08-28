@@ -105,6 +105,24 @@ export function managedExecutable(host: Host, version: string): string {
   return path.join(managedBinRoot(host), version, EXECUTABLE_NAME);
 }
 
+/**
+ * Whether `candidate` names a file under {@link managedBinRoot}.
+ *
+ * The one path predicate that decides ownership: nothing but this package ever
+ * writes under that root, so a `command` inside it is decidably this package's
+ * own even after the state that recorded it was lost. `path.relative` rather
+ * than a `startsWith` on the raw string, because a sibling directory whose name
+ * merely shares the prefix -- `bin-backup`, `bin.old` -- passes the string test
+ * and is not inside the root; adopting one would be exactly the silent
+ * overwrite the ownership test exists to prevent. A relative `command` is never
+ * ours: every path this package writes is absolute.
+ */
+export function insideManagedBinRoot(host: Host, candidate: string): boolean {
+  if (!path.isAbsolute(candidate)) return false;
+  const inside = path.relative(managedBinRoot(host), candidate);
+  return inside !== "" && !inside.startsWith("..") && !path.isAbsolute(inside);
+}
+
 /** This package's state file: source, version, digest, pin, last check. */
 export function statePath(host: Host): string {
   return path.join(packageRoot(host), "state.json");

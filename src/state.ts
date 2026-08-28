@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { statePath, type Host } from "./paths.ts";
@@ -73,11 +74,43 @@ export async function readState(host: Host): Promise<State> {
  * Whole-document rather than field-wise because the document is small and one
  * writer owns it; a partial update would need a lock this package does not
  * have. Callers read, spread, and write.
+ *
+ * Staged beside the file and renamed in, rather than truncated in place: a
+ * write interrupted by a crash or a `SIGKILL` at shutdown leaves a document
+ * that no longer parses, and this file degrades silently -- the reader above
+ * falls back to the empty state, which forgets the operator's pin and the
+ * `wroteCommand` that decides whether the MCP entry is this package's to take
+ * back. `rename` within one directory is atomic, so a reader sees either the
+ * old document or the new one. The staging name carries the pid and a random
+ * suffix so two writers never share it.
+ *
+ * The destination's own mode is reproduced before the rename, because `rename`
+ * replaces the destination rather than truncating it and the visible file would
+ * otherwise inherit the staging file's default. Nothing recorded here is a
+ * secret, but a package-private cache is not the operator's to have widened by a
+ * write they did not ask for; a file this write creates gets 0600.
  */
 export async function writeState(host: Host, next: State): Promise<void> {
   const file = statePath(host);
   await mkdir(path.dirname(file), { recursive: true });
-  await Bun.write(file, `${JSON.stringify(next, null, 2)}\n`);
+
+  const staging = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    let mode = 0o600;
+    try {
+      mode = (await stat(file)).mode & 0o777;
+    } catch (error) {
+      const code = (error as { code?: string } | null | undefined)?.code;
+      if (code !== "ENOENT") throw error;
+    }
+
+    await Bun.write(staging, `${JSON.stringify(next, null, 2)}\n`);
+    await chmod(staging, mode);
+    await rename(staging, file);
+  } catch (error) {
+    await rm(staging, { force: true });
+    throw error;
+  }
 }
 
 /** Merges `patch` into the recorded state and writes the result. */

@@ -83,6 +83,13 @@ export async function managedCopy(host: Host, state?: State): Promise<ManagedCop
  * A pin comes first because it is explicit operator intent, and it can only
  * ever select a managed copy -- this package does not relocate or re-version a
  * system installation.
+ *
+ * Nothing here executes the candidate: a file that is present, named and
+ * executable is adopted without being run. Deliberate -- this runs on the
+ * session-start path, and spawning an unknown binary on every session start is a
+ * worse default than adopting a path that turns out not to run. The version is
+ * read separately by {@link resolvedVersion}, which `/cbm status` calls and
+ * reports as "unknown (it did not run)" when the candidate will not execute.
  */
 export async function resolveExecutable(host: Host, state?: State): Promise<Resolution> {
   const current = state ?? (await readState(host));

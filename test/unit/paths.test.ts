@@ -11,10 +11,8 @@ interface AgentDirCase {
   readonly scenario: string;
   /** The environment beyond `HOME` and `PATH`. */
   readonly env: Readonly<Record<string, string>>;
-  /** The agent directory, relative to the scratch home. `null` means absolute. */
-  readonly relative: string | null;
-  /** Used only when {@link AgentDirCase.relative} is `null`. */
-  readonly absolute?: string;
+  /** The agent directory this environment must resolve to. */
+  readonly expected: (scratch: Scratch) => string;
 }
 
 /**
@@ -30,42 +28,41 @@ const agentDirs: AgentDirCase[] = [
   {
     scenario: "no profile and no override resolves the default agent directory",
     env: {},
-    relative: ".omp/agent",
+    expected: (scratch) => path.join(scratch.home, ".omp/agent"),
   },
   {
     scenario: "OMP_PROFILE resolves that profile's agent directory",
     env: { OMP_PROFILE: "work" },
-    relative: ".omp/profiles/work/agent",
+    expected: (scratch) => path.join(scratch.home, ".omp/profiles/work/agent"),
   },
   {
     scenario: "PI_PROFILE is honoured as the legacy fallback",
     env: { PI_PROFILE: "legacy" },
-    relative: ".omp/profiles/legacy/agent",
+    expected: (scratch) => path.join(scratch.home, ".omp/profiles/legacy/agent"),
   },
   {
     // OMP resolves the canonical variable first and consults the legacy one only
     // when the canonical one is undefined.
     scenario: "OMP_PROFILE wins over PI_PROFILE",
     env: { OMP_PROFILE: "work", PI_PROFILE: "legacy" },
-    relative: ".omp/profiles/work/agent",
+    expected: (scratch) => path.join(scratch.home, ".omp/profiles/work/agent"),
   },
   {
     // An explicitly empty OMP_PROFILE selects the default profile rather than
     // silently inheriting the legacy variable, which is OMP's own rule.
     scenario: "an empty OMP_PROFILE selects the default profile, not PI_PROFILE",
     env: { OMP_PROFILE: "", PI_PROFILE: "legacy" },
-    relative: ".omp/agent",
+    expected: (scratch) => path.join(scratch.home, ".omp/agent"),
   },
   {
     scenario: "PI_CODING_AGENT_DIR takes precedence over a profile variable",
     env: { PI_CODING_AGENT_DIR: "/tmp/cbm-explicit-agent", OMP_PROFILE: "work" },
-    relative: null,
-    absolute: "/tmp/cbm-explicit-agent",
+    expected: () => "/tmp/cbm-explicit-agent",
   },
   {
     scenario: "PI_CONFIG_DIR renames the config directory every path hangs off",
     env: { PI_CONFIG_DIR: ".omp-alt" },
-    relative: ".omp-alt/agent",
+    expected: (scratch) => path.join(scratch.home, ".omp-alt/agent"),
   },
 ];
 
@@ -75,12 +72,10 @@ test("every case names itself distinctly", () => {
 });
 
 describe("agent directory resolution", () => {
-  test.each(agentDirs)("$scenario", async ({ env, relative, absolute }) => {
+  test.each(agentDirs)("$scenario", async ({ env, expected }) => {
     const scratch = await makeScratch({ env });
     try {
-      expect(agentDir(scratch.host)).toBe(
-        relative === null ? (absolute ?? "") : path.join(scratch.home, relative),
-      );
+      expect(agentDir(scratch.host)).toBe(expected(scratch));
     } finally {
       await dropScratch(scratch);
     }
