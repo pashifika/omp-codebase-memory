@@ -32,6 +32,12 @@ const DEFAULT_TIMEOUT_MS = 20_000;
  * Upstream's installer refuses the same 1 MiB, for the same reason: the digest
  * file is a few kilobytes of text, so anything larger is not the file this
  * package believes it is parsing.
+ *
+ * Enforced twice on purpose. {@link readBounded} stops the download at the
+ * limit, which is the only place the memory is actually saved, and
+ * {@link parseChecksums} refuses an over-limit buffer whatever produced it --
+ * because the parser is reachable from a {@link ReleaseSource} that never went
+ * through the download at all.
  */
 export const CHECKSUMS_LIMIT_BYTES = 1_048_576;
 
@@ -212,7 +218,12 @@ export interface ReleaseSource {
 export function githubReleaseSource(): ReleaseSource {
   return {
     latestTag: resolveLatestTag,
-    checksums: (tag) => download(`${RELEASES}/download/${encodeURIComponent(tag)}/checksums.txt`),
+    checksums: (tag) =>
+      downloadBounded(
+        `${RELEASES}/download/${encodeURIComponent(tag)}/checksums.txt`,
+        CHECKSUMS_LIMIT_BYTES,
+        "checksums.txt",
+      ),
     asset: (tag, name) =>
       download(`${RELEASES}/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`),
   };
@@ -224,4 +235,67 @@ async function download(url: string): Promise<Uint8Array> {
     throw new Error(`GET ${url} answered HTTP ${response.status}`);
   }
   return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * A {@link download} whose body is refused the moment it passes `limitBytes`.
+ *
+ * Separated from {@link download} because only the digest file has a published
+ * size to hold it to; the archive's size is whatever upstream built.
+ */
+async function downloadBounded(url: string, limitBytes: number, what: string): Promise<Uint8Array> {
+  const response = await fetchHttps(url);
+  if (!response.ok) {
+    throw new Error(`GET ${url} answered HTTP ${response.status}`);
+  }
+  return await readBounded(response.body, limitBytes, what);
+}
+
+/**
+ * A response body, read no further than `limitBytes`.
+ *
+ * The bound is enforced while the body arrives rather than once it has, which
+ * is the whole point of having one: `response.arrayBuffer()` allocates every
+ * byte before anything can look at the total, so a limit checked afterwards
+ * refuses a body the process has already paid for. A `content-length`
+ * precheck is not a substitute either -- a chunked response carries no length
+ * -- so the count is kept over the chunks themselves.
+ *
+ * Exported for the same reason as {@link nextHop}: the refusal is only
+ * reachable from a test that can hand it a body, and standing up an HTTPS
+ * origin that streams a megabyte is not something a unit test should need.
+ */
+export async function readBounded(
+  body: ReadableStream<Uint8Array> | null,
+  limitBytes: number,
+  what: string,
+): Promise<Uint8Array> {
+  if (body === null) return new Uint8Array();
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limitBytes) {
+        throw new Error(`${what} is over the ${limitBytes} byte safety limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    // Cancelling is what drops the connection on the refusal path; on the
+    // ordinary path the stream is already done and this is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return joined;
 }

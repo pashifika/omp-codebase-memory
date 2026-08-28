@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { fetchHttps, nextHop, tagFromLocation } from "../../src/release.ts";
+import {
+  CHECKSUMS_LIMIT_BYTES,
+  fetchHttps,
+  nextHop,
+  readBounded,
+  tagFromLocation,
+} from "../../src/release.ts";
 
 /**
  * The transport-downgrade defence and the release-tag parser.
@@ -13,6 +19,9 @@ import { fetchHttps, nextHop, tagFromLocation } from "../../src/release.ts";
  */
 
 const HTTPS_ORIGIN = "https://github.com/DeusData/codebase-memory-mcp/releases/latest";
+
+/** One chunk of a streamed body, the size a real one arrives in. */
+const CHUNK_BYTES = 64 * 1024;
 
 interface HopCase {
   readonly scenario: string;
@@ -206,5 +215,49 @@ describe("release tag resolution", () => {
 
   test.each(refusedTags)("$scenario", ({ status, location, reported }) => {
     expect(() => tagFromLocation(status, location)).toThrow(reported);
+  });
+});
+
+/** A body of `chunks` 64 KiB chunks that records how many were pulled. */
+function countedBody(chunks: number): { body: ReadableStream<Uint8Array>; pulled: () => number } {
+  const chunk = new Uint8Array(CHUNK_BYTES).fill(0x61);
+  let pulled = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulled += 1;
+      if (pulled > chunks) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunk);
+    },
+  });
+  return { body, pulled: () => pulled };
+}
+
+describe("the bounded body reader", () => {
+  test("a body under the limit is returned whole", async () => {
+    const { body } = countedBody(2);
+    expect((await readBounded(body, CHECKSUMS_LIMIT_BYTES, "checksums.txt")).byteLength).toBe(
+      2 * CHUNK_BYTES,
+    );
+  });
+
+  test("an oversized body is refused without being read to the end", async () => {
+    // 4 MiB offered against a 128 KiB limit. Counting the pulls is what
+    // separates a limit enforced while the body arrives from one checked after
+    // `arrayBuffer()` has already allocated every byte of it -- both refuse,
+    // and only one of them refuses before paying.
+    const { body, pulled } = countedBody(64);
+    const limit = 2 * CHUNK_BYTES;
+
+    await expect(readBounded(body, limit, "checksums.txt")).rejects.toThrow(
+      /checksums\.txt is over the 131072 byte safety limit/u,
+    );
+    expect(pulled()).toBeLessThanOrEqual(4);
+  });
+
+  test("a response with no body at all reads as empty", async () => {
+    expect((await readBounded(null, CHECKSUMS_LIMIT_BYTES, "checksums.txt")).byteLength).toBe(0);
   });
 });

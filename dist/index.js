@@ -192,7 +192,7 @@ function parseChecksums(body, archive) {
 function githubReleaseSource() {
   return {
     latestTag: resolveLatestTag,
-    checksums: (tag) => download(`${RELEASES}/download/${encodeURIComponent(tag)}/checksums.txt`),
+    checksums: (tag) => downloadBounded(`${RELEASES}/download/${encodeURIComponent(tag)}/checksums.txt`, CHECKSUMS_LIMIT_BYTES, "checksums.txt"),
     asset: (tag, name) => download(`${RELEASES}/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`)
   };
 }
@@ -202,6 +202,41 @@ async function download(url) {
     throw new Error(`GET ${url} answered HTTP ${response.status}`);
   }
   return new Uint8Array(await response.arrayBuffer());
+}
+async function downloadBounded(url, limitBytes, what) {
+  const response = await fetchHttps(url);
+  if (!response.ok) {
+    throw new Error(`GET ${url} answered HTTP ${response.status}`);
+  }
+  return await readBounded(response.body, limitBytes, what);
+}
+async function readBounded(body, limitBytes, what) {
+  if (body === null)
+    return new Uint8Array;
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;; ) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      total += value.byteLength;
+      if (total > limitBytes) {
+        throw new Error(`${what} is over the ${limitBytes} byte safety limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return joined;
 }
 
 // src/scheduler.ts

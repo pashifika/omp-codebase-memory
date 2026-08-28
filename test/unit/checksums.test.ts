@@ -49,9 +49,14 @@ const publishedDigests: PublishedDigestCase[] = [
     digest: "e2804a20f5a6fc392af361525a232703e351b7d1aacb81b88eef806eec5959fa",
   },
   {
-    // Upstream publishes a `-ui-` alias carrying the same bytes. It matters only
-    // that the name resolves through its own line rather than a neighbour's.
-    scenario: "the -ui- alias for linux/arm64 portable resolves through its own line",
+    // Upstream publishes a `-ui-` alias for every asset, carrying the same
+    // bytes and therefore the same digest as the archive it aliases (fixture
+    // lines 5 and 22 are identical but for the name). So this case can only
+    // show the alias entry is there and gets selected -- a parser that resolved
+    // it through its neighbour's line would return the same digest and pass.
+    // Exactness is proven by the case above, whose digest genuinely differs
+    // from the name it sits beside.
+    scenario: "the -ui- alias for linux/arm64 portable is present and selectable",
     archive: "codebase-memory-mcp-ui-linux-arm64-portable.tar.gz",
     digest: "5697d986d9716c913163b4bff7b3a294287f3b843e993bc1ff71e78dcdc21781",
   },
