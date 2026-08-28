@@ -1,51 +1,22 @@
 # Repository Guidelines
 
-## Authority
+## Authority and scope
+
+`omp-codebase-memory` distributes `codebase-memory-mcp` (CBM) as an installable
+OMP extension: it owns the executable's lifecycle, wires one MCP server entry,
+and ships context artifacts harvested from that executable. It is TypeScript on
+Bun, has no npm runtime dependencies, and commits its bundled entry points at
+`dist/index.js` and `dist/augment.js`. `README.md` states what the package does
+for an operator; this file does not restate it.
 
 `rasen/specs/` contains the accepted capability specifications and outranks
 change proposals. `rasen/changes/` records design decisions and their rationale;
-do not duplicate that rationale here.
+do not duplicate that rationale here. When implementation changes a normative
+decision, update the affected specification in the same change.
 
-When implementation changes a normative decision, update the affected
-specification in the same change.
-
-## Project boundaries
-
-`omp-codebase-memory` distributes `codebase-memory-mcp` (CBM) as an installable
-OMP extension. It is TypeScript on Bun, has no npm runtime dependencies, and
-commits its bundled entry points at `dist/index.js` and `dist/augment.js`.
-
-The following boundaries are fixed:
-
-- Consume CBM release artifacts; contributing changes to
-  `DeusData/codebase-memory-mcp` is out of scope.
-- Adopt an existing `codebase-memory-mcp` on `PATH` and never replace it. Put a
-  package-managed copy under a package-owned root outside the plugin tree. Never
-  write `~/.local/bin` or modify an executable this package did not install.
-- Own exactly the `codebase-memory-mcp` key under `mcpServers` in the active OMP
-  agent directory's `mcp.json`. Upsert it idempotently, fail closed on an
-  unparseable file or foreign `command`, and remove it only while it still
-  matches the package-owned entry.
-- Never create or modify an operator's OMP agent-directory `AGENTS.md` or
-  `RULES.md`.
-- Never register a `tool_call` handler. Augment successful output through
-  `tool_result`, append rather than replace prior content, and fail open.
-- Never use platform timer globals. Use the handler context's managed timers
-  through `src/scheduler.ts`.
-- Never set an account-wide CBM configuration key for the operator.
-- Never duplicate an action already exposed through CBM's MCP tools, including
-  indexing.
-- Never hand-edit generated context artifacts; regenerate them from the CBM
-  executable.
-- Never place verification scratch inside a directory the operator owns, and
-  never delete a directory this package or its verification did not create. A
-  project-local plugin root belongs in a temporary directory, not under the
-  repository's `.omp/`, which holds the operator's own project-local skills and
-  configuration.
-
-This package owns only the executable it downloaded and its MCP entry. CBM owns
-the graph, indexing, watcher, cache root, and updates to a system installation.
-Windows and changes to any other operator file are out of scope.
+This file is the authority for repository guidance. `AGENTS.md` is a tracked
+symbolic link to it, so both agent tool families read one text; do not create a
+second copy of these rules anywhere.
 
 ## Repository layout
 
@@ -60,65 +31,202 @@ The working tree contains two independent Git repositories:
 
 ## Git workflow
 
-`main` and release tags are protected by the committed rulesets under
-`.github/rulesets/`. Before implementation, create a short-lived topic branch
-named `<type>/<short-slug>`.
+Never commit implementation to the default branch. Cut a short-lived topic
+branch from it before implementation begins, and name it `<type>/<short-slug>`
+using the Conventional Commits type that dominates the change. Branches already
+landed this way: `feat/graph-context-and-agents`,
+`docs/repository-guidelines`, `chore/commit-ruleset-payloads`.
 
-Use Conventional Commits and land changes through pull requests. The ruleset
-permits merge commits only; do not squash. Unresolved review threads block the
-merge.
+The default branch and release tags are protected by the rulesets committed
+under `.github/rulesets/`. Those files are the authority for every parameter;
+read them rather than trusting a value repeated in prose. Their shape:
 
-Treat the committed rulesets as authoritative. Change and reimport those files
-rather than editing protection through the web interface.
+- The default branch rejects deletion and non-fast-forward pushes.
+- Landing a change requires a pull request whose review threads are resolved.
+- The merge commit is the only permitted merge method.
+- Exactly one status check, named `ci`, is required, under a strict policy — so
+  a branch must be current with the default branch before it can merge.
+- Release tags matching the ruleset's pattern reject deletion and
+  non-fast-forward pushes.
+
+Change protection by editing those files and reimporting them, never through the
+web interface. A rule changed in the browser is invisible to review and is
+overwritten by the next import.
+
+The merge-only restriction is pinned rather than preferred. A squash rewrites
+the commits a dependent pull request still carries, so every downstream diff
+re-inflates with changes that already landed and each dependent branch needs a
+rebase per merge. Preserving the commits is what makes a dependent pull-request
+chain cheap here: a branch stacked on another stays mergeable while its parent
+lands.
+
+Commit messages follow Conventional Commits. Choose commit boundaries for
+coherence — one reviewable decision per commit — rather than by file count or
+by when the work happened.
 
 ## CI and release
 
 Branch protection requires one status check named `ci`. It is the gate job in
-`.github/workflows/ci.yml`, runs under `if: always()`, fails when it aggregates
-no jobs, and accepts only successful dependencies.
+`.github/workflows/ci.yml`: it runs under `if: always()`, fails when it
+aggregates no jobs, and accepts only successful dependencies. `always()` is
+load-bearing, because a skipped required check blocks a pull request instead of
+failing it.
 
-- Update the gate's `needs` whenever a required runtime job changes. Do not add
-  runtime job names to the ruleset.
-- Keep `install-check` outside the gate because it cannot install a pull
-  request's merge ref.
-- Pin every external `uses:` to a full 40-character commit SHA followed by a
-  version comment.
-- Default to `permissions: contents: read`, use
-  `persist-credentials: false`, and grant `contents: write` only to the release
-  publish job.
-- Do not apply `paths` filters to jobs required by the gate.
+- Runtime job names never appear in a ruleset. Adding, removing, or
+  restructuring a runtime job means editing the gate's `needs` and nothing else.
+  Renaming the gate job silently blocks every merge, with no failing job to
+  point at.
+- Keep `install-check` outside the gate because it installs by ref and a pull
+  request's merge ref does not exist on the remote as an installable ref.
+- Every `uses:` reference is pinned to a full 40-hex commit SHA followed by a
+  trailing version comment. The `hygiene` job enforces both halves and fails
+  when it finds no references to check.
+- Default to `permissions: contents: read`, use `persist-credentials: false`,
+  and grant `contents: write` only to the release publish job.
+- Do not apply `paths` filters to jobs the gate requires.
 - Pin Bun and its matching `@types/bun` version exactly. Install with
   `--frozen-lockfile`.
 - Run checks through package scripts and print toolchain versions with results.
 - Do not add a Node job; Node is not a supported runtime.
 
-`dist/index.js` and the feature entry `dist/augment.js` are committed. CI must
-read the bundle list from `package.json`'s extension entries, build from
-source, and compare each result byte-for-byte with its tracked bundle.
+`dist/index.js` and the feature entry `dist/augment.js` are committed. CI reads
+the bundle list from `package.json`'s extension entries, builds from source, and
+compares each result byte-for-byte with its tracked bundle.
 
-A release tag must match `package.json`'s version and both the version and source
-ref in `.omp-plugin/marketplace.json`. Create releases only from verified tags.
+A release tag must match `package.json`'s version and both the version and
+source ref in `.omp-plugin/marketplace.json`. Create releases only from verified
+tags. `CONTRIBUTING.md` holds the procedure.
 
 ## Testing and verification
 
-Add deterministic tests for changed behavior. Cover the package boundaries
-affected by the change: release selection and checksums, archive validation,
-executable resolution, MCP-entry ownership, transport security, scheduler
-behavior, and handler fail-open paths.
+Add deterministic tests for changed behavior. Cover the package boundaries the
+change touches: release selection and checksums, archive validation, executable
+resolution, MCP-entry ownership, transport security, scheduler behavior, and
+handler fail-open paths.
 
-`test/unit` must not require a CBM executable or network access. Use recorded
-fixtures under `test/fixtures` and helpers in `test/support`. `test/packaging`
-may build and load the bundle and touch the filesystem. Checks that require a
-real executable or network access belong in a separate job.
+Where a new test belongs:
+
+- `test/unit` by default. It must not require a CBM executable or network
+  access. Use recorded fixtures under `test/fixtures` and helpers in
+  `test/support`.
+- `test/packaging` when the test needs a build or a real load of the bundle. It
+  may touch the filesystem.
+- A CI job of its own when the check needs a real executable or the network, as
+  `harvest` and `install-check` do. Neither suite may acquire either.
 
 Report the commands and revision used for verification. State which relevant
 checks were not run and why; never claim an unexecuted check passed.
 
+## Prohibitions
+
+Each entry carries the mechanism that makes it a rule. A prohibition whose
+reason reduces to "it breaks things" is removed by the next contributor who
+finds it inconvenient.
+
+**Never replace an executable this package did not install.** Adopt an existing
+`codebase-memory-mcp` from `PATH` or `~/.local/bin` as it is. Place a managed
+copy only under this package's own root, `~/.omp/codebase-memory/bin/<version>/`
+(`src/paths.ts`), which is outside both the plugin tree and the agent directory
+— OMP replaces version-qualified plugin directories on reinstall, so an
+executable stored inside one is discarded and re-downloaded by a routine plugin
+upgrade. System installations win because CBM resolves one canonical per-account
+cache root and refuses to run when a process is configured against a different
+root while any CBM session is active: two executables of different versions
+sharing that root produce mismatched index generations. `~/.local/bin` is CBM's
+own installer's directory and CBM's `update` owns the file there.
+
+**Own exactly the `codebase-memory-mcp` key under `mcpServers` in the active
+agent directory's `mcp.json`, and nothing else in that file.** Upsert it
+idempotently, and remove it only while it still matches the package-owned entry.
+OMP's own `/mcp add` writes the same file with no lock shared with this package,
+so the write is a read-modify-write against observed content that fails closed on
+a shape it does not recognise: a lost update degrades to a missing entry the next
+session start rewrites, rather than a corrupted file. A `command` under that key
+that this package did not write means another installer owns the name, so the
+file is left untouched and both paths are reported.
+
+**Never create or modify an operator's OMP agent-directory `AGENTS.md` or
+`RULES.md`.** Both are single-slot: the reader takes one file per slot, so
+writing either does not add to the operator's instructions, it silently
+suppresses them. In the agent directory `AGENTS.md` is the one surviving
+user-level context file, and `RULES.md` occupies the single slot reserved for the
+operator's sticky rules. This scopes to the operator's runtime directory. It is
+explicitly not about this repository's own root `CLAUDE.md` and `AGENTS.md`,
+which are project context discovered from a checkout and claim neither slot — a
+reader who conflates the two will read the rule as contradicting the file it is
+written in.
+
+**Never delete `.omp/`, at either location.** `.omp/` is an OMP directory that
+belongs to the operator: `~/.omp/` holds their account configuration, and this
+repository's own `<project>/.omp/` holds their project-local `config.yml` and
+skills root. Neither may be deleted, and neither becomes deletable because a
+verification step is what materialized it. Cleaning up verification scratch
+removes exactly the paths that step created, named one by one — never a
+containing directory. The loss is silent by mechanism: a global ignore excludes
+`/.omp/`, so the directory is untracked, `git status` never reports it missing,
+and nothing fails until a later session reads what is no longer there.
+
+The incident behind that entry: verifying an install with `enabledFeatures: []`
+needs a plugin root carrying that selection, and one was created under
+`<project>/.omp/plugins/`. Cleaning it up took the operator's `config.yml` and
+project-local skills root with it, and the loss surfaced a session later as a
+skill registry advertising roughly sixty skills while resolving five. The
+placement that avoids it is a temporary directory — `mktemp -d`, which is what
+CI already uses for a scratch `HOME` — never a path under `<project>/.omp/` or
+`~/.omp/`.
+
+**Never register a `tool_call` handler.** OMP treats a handler that throws or
+blocks there as a refusal of the tool call, so one slow graph query would deny
+the operator's `grep`. Augment successful output through `tool_result`, where a
+failure is caught and the run continues; append rather than replace prior
+content, and fail open.
+
+**Never call the platform timer globals.** Use the handler context's managed
+timers through `src/scheduler.ts`. A raw `setTimeout` callback that throws
+escapes handler dispatch entirely and surfaces as a process-level
+`uncaughtException`, which OMP's postmortem handler treats as fatal and tears
+down the whole session. The context's timers run the callback with handler
+isolation, are `unref`'d, and are cleared on `session_shutdown`.
+
+**Never set an account-wide CBM configuration key for the operator.** That
+configuration is per-account and shared with every other CBM client on the
+machine, so a key written here changes behaviour for tools this package does not
+own and cannot restore.
+
+**Never duplicate an action CBM's MCP tools already expose, indexing included.**
+The model already holds `index_repository`, and a second path through this
+package would take its own arguments and defaults — the two diverge, and the
+operator cannot tell which one ran.
+
+**Never hand-edit a generated context artifact.** Regenerate with
+`bun run harvest`. The source of these artifacts is embedded in the CBM
+executable and changes with it, so a hand edit is a second, diverging statement
+of the same contract until the next regeneration overwrites it. A unit test
+re-runs every build guard against the committed files, and the `harvest` CI job
+regenerates and diffs them.
+
+Contributing changes to `DeusData/codebase-memory-mcp` is out of scope; this
+package consumes CBM release artifacts. This package owns only the executable it
+downloaded and its MCP entry. CBM owns the graph, indexing, the watcher, the
+cache root, and updates to a system installation. Windows and changes to any
+other operator file are out of scope.
+
 ## Documentation
 
 `README.md` is operator-facing and must be created or rewritten through the
-`readme-creator` skill and its quality checklist. If that skill is unavailable,
-stop rather than editing the README by hand.
+`readme-creator` skill, following its phases and scored against its quality
+checklist. If that skill cannot be resolved by name, stop; do not edit the README
+by hand. `CONTRIBUTING.md` holds only procedures that need maintainer
+credentials and links here for every rule.
 
-This file is the authority for repository guidance. `AGENTS.md` must remain a
-tracked symbolic link to `CLAUDE.md`; do not create another copy of these rules.
+`AGENTS.md` must remain a tracked symbolic link to `CLAUDE.md`, with `CLAUDE.md`
+as the regular file. Both names are needed and neither reader finds the other's
+file: Claude Code reads the root `CLAUDE.md`, while OMP's `claude` provider
+reads `.claude/CLAUDE.md` and discovers a root `AGENTS.md` through its
+standalone provider. Two regular files would satisfy both readers and diverge on
+the first one-sided edit.
+
+Do not add `.omp/AGENTS.md`. This repository's `.omp/` is non-empty, so a native
+project context file there would win the depth-0 scope and shadow the root file
+that both readers already find — replacing one text with a second that only OMP
+sees, for no gain.
