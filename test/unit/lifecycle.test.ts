@@ -26,10 +26,13 @@ import {
   upstreamInstallDir,
 } from "../../src/paths.ts";
 import { describeTarget, type Target } from "../../src/platform.ts";
+import { projectResolver } from "../../src/project.ts";
 import { readState, updateState } from "../../src/state.ts";
 import { buildArchive, dropBuiltArchives, fakeSource, releaseMembers } from "../support/release.ts";
 import { dropScratch, makeScratch, writeFakeExecutable, type Scratch } from "../support/scratch.ts";
 
+import type { GraphClient } from "../../src/graph.ts";
+import type { ProjectResolution } from "../../src/project.ts";
 import type { ReleaseSource } from "../../src/release.ts";
 
 const TARGET: Target = describeTarget(process.platform === "darwin" ? "darwin" : "linux", "arm64");
@@ -119,7 +122,7 @@ describe("no lifecycle operation writes to ~/.local/bin", () => {
     expect((await pin(lifecycle, VERSION)).ok).toBe(true);
     expect((await update(lifecycle)).ok).toBe(true);
     expect((await unpin(lifecycle)).ok).toBe(true);
-    expect((await status(lifecycle)).resolved).not.toBeNull();
+    expect((await status(lifecycle, unindexed)).resolved).not.toBeNull();
     expect((await uninstall(lifecycle)).ok).toBe(true);
 
     // Positively, by code: a bare `rejects.toThrow()` is satisfied by any
@@ -420,6 +423,48 @@ describe("uninstall", () => {
     expect(await Bun.file(packageRoot(scratch.host)).exists()).toBe(false);
     expect(await Bun.file(file).text()).toBe(foreign);
   });
+
+  /**
+   * The graph belongs to CBM and is shared with every other client configured
+   * on the account, so removing this package must not remove an index some
+   * other editor is using.
+   *
+   * Checked from both ends. Behaviourally: the project list the resolver
+   * reports is identical before and after, and `uninstall` made no graph call
+   * at all. And by name: `delete_project` exists in CBM's tool surface, so the
+   * assertion that this package never calls it is worth making where a future
+   * "tidy up on uninstall" would have to add it.
+   */
+  test("deletes no indexed project, and does not so much as ask the graph", async () => {
+    const lifecycle = await lifecycleFor(VERSION);
+    await install(lifecycle);
+
+    const asked: string[] = [];
+    const client: GraphClient = {
+      call: async (tool) => {
+        asked.push(tool);
+        return tool === "list_projects" ? { projects: [{ name: "app", root_path: scratch.home }] } : null;
+      },
+      toolNames: async () => null,
+      close: () => {},
+    };
+
+    const before = await projectResolver(client, scratch.home).resolve();
+    asked.length = 0;
+
+    expect((await uninstall(lifecycle)).ok).toBe(true);
+
+    expect(asked).toEqual([]);
+    expect(await projectResolver(client, scratch.home).resolve()).toEqual(before);
+  });
+
+  test("no lifecycle module names CBM's project-deleting tool", async () => {
+    const modules = ["src/lifecycle.ts", "src/index.ts", "src/augment.ts", "src/augment-entry.ts", "src/project.ts"];
+    for (const module of modules) {
+      const source = await Bun.file(path.resolve(import.meta.dir, "..", "..", module)).text();
+      expect(source).not.toContain("delete_project");
+    }
+  });
 });
 
 describe("status", () => {
@@ -430,7 +475,7 @@ describe("status", () => {
       `echo "codebase-memory-mcp 0.9.0"`,
     );
 
-    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource });
+    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource }, unindexed);
     const text = report.lines.join("\n");
 
     expect(text).toContain("source:     system (PATH)");
@@ -439,10 +484,104 @@ describe("status", () => {
   });
 
   test("names the resolved agent directory so a profile-scoped write is visible", async () => {
-    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource });
+    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource }, unindexed);
     expect(report.lines.join("\n")).toContain(`agent dir:  ${path.join(scratch.home, ".omp/agent")}`);
   });
+
+  test("does not consult the graph when nothing resolves, and says so", async () => {
+    let consulted = 0;
+    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource }, async () => {
+      consulted += 1;
+      return { kind: "unindexed" };
+    });
+
+    expect(consulted).toBe(0);
+    expect(report.lines.join("\n")).toContain("index:      not checked (no executable resolved)");
+  });
 });
+
+/**
+ * The index lines status reports, over each answer the probe can give.
+ *
+ * The probe is the seam the real graph client sits behind, so the reported
+ * shape is checkable without a CBM executable -- and "an unindexed directory is
+ * not an error" is a property of the text, which is exactly what an operator
+ * reads.
+ */
+interface IndexCase {
+  readonly scenario: string;
+  readonly probed: ProjectResolution;
+  readonly expected: readonly string[];
+  /** A line that must not appear, so a plain report cannot drift into an error. */
+  readonly absent?: string;
+}
+
+const indexCases: IndexCase[] = [
+  {
+    scenario: "a covered directory reports the project name and its recorded root",
+    probed: { kind: "project", project: { name: "graph-project", root: "/work/graph-project" } },
+    expected: ["index:      graph-project", "index root: /work/graph-project"],
+  },
+  {
+    scenario: "an uncovered directory is reported plainly rather than as an error",
+    probed: { kind: "unindexed" },
+    expected: ["index:      this directory is not covered by an indexed project"],
+    absent: "error",
+  },
+  {
+    scenario: "an empty graph reads the same as no match, because it is the same state",
+    probed: { kind: "unindexed" },
+    expected: ["index:      this directory is not covered by an indexed project"],
+  },
+  {
+    scenario: "a graph that did not answer is reported as unknown",
+    probed: { kind: "unavailable" },
+    expected: ["index:      unknown (the graph did not answer)"],
+  },
+];
+
+test.each(indexCases)("$scenario", async ({ probed, expected, absent }) => {
+  await writeFakeExecutable(path.join(scratch.pathDir, EXECUTABLE_NAME), `echo "codebase-memory-mcp ${VERSION}"`);
+
+  const report = await status(
+    { host: scratch.host, target: TARGET, source: forbiddenSource },
+    async () => probed,
+  );
+  const text = report.lines.join("\n");
+
+  for (const line of expected) expect(text).toContain(line);
+  if (absent !== undefined) expect(text.toLowerCase()).not.toContain(absent);
+});
+
+test("the resolver behind status and the augmentation is one implementation, reused in a session", async () => {
+  await writeFakeExecutable(path.join(scratch.pathDir, EXECUTABLE_NAME), `echo "codebase-memory-mcp ${VERSION}"`);
+
+  // One `list_projects` answer, one resolver, two consumers: whatever status
+  // reports is the same object the augmentation would have queried with.
+  let listed = 0;
+  const client: GraphClient = {
+    call: async (tool) => {
+      if (tool !== "list_projects") return null;
+      listed += 1;
+      return { projects: [{ name: "graph-project", root_path: scratch.home }] };
+    },
+    toolNames: async () => null,
+    close: () => {},
+  };
+  const resolver = projectResolver(client, path.join(scratch.home, "nested", "dir"));
+
+  const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource }, async () =>
+    await resolver.resolve(),
+  );
+  const forAugmentation = await resolver.resolve();
+
+  expect(listed).toBe(1);
+  expect(report.lines.join("\n")).toContain("index:      graph-project");
+  expect(forAugmentation).toEqual({ kind: "project", project: { name: "graph-project", root: scratch.home } });
+});
+
+/** The probe every status test that is not about index state passes. */
+const unindexed = async (): Promise<ProjectResolution> => ({ kind: "unindexed" });
 
 /** A confirmer whose answer is fixed, recording whether it was consulted. */
 function fixedConfirmer(available: boolean, answer: boolean): Confirmer & { asked: string[] } {

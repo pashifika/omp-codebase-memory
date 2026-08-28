@@ -1,9 +1,14 @@
 import { existsSync } from "node:fs";
 
+import { openGraphClient } from "./graph.ts";
 import { hostTarget, UnsupportedPlatformError } from "./platform.ts";
 import { nativeExtensionPath, processHost } from "./paths.ts";
+import { projectResolver } from "./project.ts";
 import { githubReleaseSource } from "./release.ts";
+import { resolvedVersion, resolveExecutable } from "./resolve.ts";
 import { schedulerFrom } from "./scheduler.ts";
+import { readState } from "./state.ts";
+import { checkToolSurface } from "./tools.ts";
 import {
   checkUpstream,
   confirmedInstall,
@@ -15,6 +20,7 @@ import {
   update,
   type ActionReport,
   type Confirmer,
+  type IndexProbe,
   type Lifecycle,
 } from "./lifecycle.ts";
 
@@ -29,13 +35,17 @@ import type {
  *
  * Two things are absent on purpose.
  *
- * There is no `tool_call` handler. OMP treats a throwing or blocking
+ * There is no `tool_call` handler, and there is now a tool handler beside that
+ * statement rather than instead of it. OMP treats a throwing or blocking
  * `tool_call` handler as a refusal of the tool call, so a context provider
  * registered there could deny an operator's `grep` because a subprocess timed
- * out. A provider that adds nothing is better than one that can take something
- * away, so the event is not registered at all -- and the output augmentation a
- * later change adds belongs on `tool_result`, which is documented as
- * middleware-style and explicitly allowed to replace content.
+ * out. `tool_result` is the inverse: middleware-style, explicitly allowed to
+ * replace a successful call's content, and a handler that throws is caught and
+ * reported while the run continues. The graph augmentation therefore lives on
+ * `tool_result` -- in its own entry, `dist/augment.js`, because feature gating
+ * applies to manifest-declared entries and an extension cannot ask which of its
+ * own features the operator selected. Neither entry registers `tool_call` under
+ * any condition.
  *
  * There is no runtime action called during load. OMP wires those after the
  * factory returns, and calling one here throws
@@ -132,6 +142,37 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
     notify(ctx, `/cbm: ${outcome.message}`, outcome.ok ? "info" : "error");
   };
 
+  /**
+   * Where a graph failure is recorded.
+   *
+   * Debug log only, deliberately: a graph query that did not answer is not
+   * something the operator asked for, and reporting it per attempt would turn a
+   * best-effort addition into a source of noise.
+   */
+  const debug = (message: string): void => {
+    pi.logger.info("omp-codebase-memory: graph", { message });
+  };
+
+  /**
+   * Asks the graph which project covers `cwd`, over a session of its own.
+   *
+   * Opened and closed around the one question, because this runs for an
+   * explicit `/cbm status` rather than continuously: the operator typed the
+   * command and a short-lived CBM process is the honest cost of answering it.
+   * The resolution goes through `projectResolver`, so status and the
+   * augmentation cannot name different projects for one directory.
+   */
+  const indexProbe = (cwd: string): IndexProbe => {
+    return async (executable) => {
+      const client = openGraphClient(executable, { onDebug: debug });
+      try {
+        return await projectResolver(client, cwd).resolve();
+      } finally {
+        client.close();
+      }
+    };
+  };
+
   pi.registerCommand("cbm", {
     description: "codebase-memory-mcp lifecycle: status, install, update, pin, unpin, uninstall",
     getArgumentCompletions: (prefix) => {
@@ -150,7 +191,7 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
 
       switch (subcommand) {
         case "status": {
-          const report_ = await status(lifecycle);
+          const report_ = await status(lifecycle, indexProbe(ctx.cwd));
           notify(ctx, ["codebase-memory-mcp", ...report_.lines].join("\n"), "info");
           return;
         }
@@ -200,11 +241,36 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
   });
 
   /**
+   * Whether the executable still has the tools the shipped guidance names.
+   *
+   * The primary drift detector, and it runs on the operator's own machine
+   * against the executable they actually have: the scheduled CI job cannot see
+   * a newer CBM on someone else's laptop, and GitHub disables a dormant
+   * repository's schedule silently. At most one notice, and a failed query is a
+   * debug line and nothing else.
+   */
+  const driftCheck = async (active: Lifecycle, ctx: ExtensionContext): Promise<void> => {
+    const resolution = await resolveExecutable(active.host, await readState(active.host));
+    if (!resolution.ok) return;
+    const version = (await resolvedVersion(resolution.resolved)) ?? resolution.resolved.executable;
+
+    const client = openGraphClient(resolution.resolved.executable, { onDebug: debug });
+    try {
+      const notice = await checkToolSurface(client, version, { onDebug: debug });
+      if (notice !== null) notifyOnce(ctx, `codebase-memory-mcp: ${notice}`, "warning");
+    } finally {
+      client.close();
+    }
+  };
+
+  /**
    * Session start: verify the owned entry, correct it, and never block.
    *
-   * The version check is deferred onto a managed timer rather than awaited
-   * here, because a session must start at the speed of the filesystem and not
-   * at the speed of the network.
+   * The version check and the tool-surface check are deferred onto one managed
+   * timer rather than awaited here, because a session must start at the speed of
+   * the filesystem and not at the speed of the network. One timer, and the two
+   * run in sequence inside it, so a session never has two CBM subprocesses of
+   * this package's making alive at once.
    */
   pi.on("session_start", async (_event, ctx) => {
     if (lifecycle === null) return;
@@ -243,6 +309,12 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
           // Debug log only: a failed check must not reach the operator, and
           // must not reach the session's error channel either.
           pi.logger.info("omp-codebase-memory: version check failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        })
+        .then(async () => await driftCheck(active, ctx))
+        .catch((error: unknown) => {
+          pi.logger.info("omp-codebase-memory: tool-surface check failed", {
             error: error instanceof Error ? error.message : String(error),
           });
         });

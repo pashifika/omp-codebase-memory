@@ -12,10 +12,20 @@
   "omp": {
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "features": {
+      "graph-augmentation": {
+        "description": "Append matching graph symbols to grep/glob results and index-coverage gaps to read results, on tool_result only.",
+        "default": true,
+        "extensions": [
+          "./dist/augment.js"
+        ]
+      }
+    }
   },
   "scripts": {
-    "build": "bun build src/index.ts --target=bun --format=esm --outfile=dist/index.js",
+    "build": "bun build src/index.ts --target=bun --format=esm --outfile=dist/index.js && bun build src/augment-entry.ts --target=bun --format=esm --outfile=dist/augment.js",
+    "harvest": "bun run scripts/harvest.ts",
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:packaging": "bun run build && bun test test/packaging",

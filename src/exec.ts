@@ -40,6 +40,15 @@ export interface RunResult {
 export interface RunOptions {
   readonly timeoutMs?: number;
   readonly cwd?: string;
+  /**
+   * Variables applied *over* the inherited environment.
+   *
+   * Merged rather than replacing, because every caller needs `PATH` to keep
+   * working and only one needs anything overridden: the harvest points `HOME`
+   * and `CBM_CACHE_DIR` at a temporary directory so `install` configures a
+   * scratch machine instead of the operator's own.
+   */
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 /** One captured pipe: its text, and whether the cap cut it short. */
@@ -185,6 +194,10 @@ export async function run(argv: readonly string[], options: RunOptions = {}): Pr
       // `child`.
       detached: true,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      // Spelled out rather than passed through, because `Bun.spawn`'s `env`
+      // *replaces* the environment: handing it the override alone would take
+      // `PATH` away from the child.
+      ...(options.env === undefined ? {} : { env: { ...process.env, ...options.env } }),
     });
 
     /**
