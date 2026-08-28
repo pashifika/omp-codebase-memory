@@ -37,6 +37,11 @@ The following boundaries are fixed:
   indexing.
 - Never hand-edit generated context artifacts; regenerate them from the CBM
   executable.
+- Never place verification scratch inside a directory the operator owns, and
+  never delete a directory this package or its verification did not create. A
+  project-local plugin root belongs in a temporary directory, not under the
+  repository's `.omp/`, which holds the operator's own project-local skills and
+  configuration.
 
 This package owns only the executable it downloaded and its MCP entry. CBM owns
 the graph, indexing, watcher, cache root, and updates to a system installation.
