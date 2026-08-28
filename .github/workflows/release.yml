@@ -71,6 +71,14 @@ jobs:
       - name: Check out the tagged tree
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
+        # This is the one job that elevates to `contents: write`, so it is the
+        # one job where a persisted credential matters: `actions/checkout`
+        # otherwise writes an `AUTHORIZATION: basic <token>` extraheader into
+        # `.git/config` and leaves a push-capable credential on disk for every
+        # later step. Nothing here needs it -- `gh release create` authenticates
+        # through `GH_TOKEN` below, not through the git remote.
+        with:
+          persist-credentials: false
 
       - name: Create the GitHub release
         timeout-minutes: 5
