@@ -245,14 +245,27 @@ export function transformSkill(source: string): Artifact {
 }
 
 /**
- * The durable rule, carrying the emitted instructions body verbatim.
+ * The rulebook rule, carrying the emitted instructions body verbatim.
  *
  * The frontmatter is load-bearing rather than decorative: a rule with no
  * `description`, no `alwaysApply`, and no trigger condition is assigned to no
- * bucket, is never injected, and is not even addressable through `rule://`.
- * `alwaysApply: true` is what makes a fresh session and a post-compaction turn
- * both carry the body, which is the behaviour CBM gets from an always-present
- * instructions file on the clients that have one.
+ * bucket, is never listed, and is not even addressable through `rule://`. A
+ * `description` alone puts it in the rulebook bucket, where OMP lists its name
+ * and description and the body is read on demand through `rule://`.
+ *
+ * `alwaysApply: true` is deliberately not set, which is a reversal. It was set
+ * first, to reproduce the always-present instructions file CBM gets on the
+ * clients that have one. Two measurements overturned that. The body's central
+ * instruction -- "ALWAYS prefer MCP graph tools over grep/glob/file-search for
+ * code discovery" -- is false on OMP where a language server exists: asked where
+ * `resolveExecutable` is used, `lsp references` answered 19 exact references
+ * with no false positives while the graph answered at function granularity and
+ * dropped the import and test sites. And the body duplicates what the MCP entry
+ * already delivers: CBM's `initialize` returns 808 bytes of `instructions` which
+ * OMP injects per session, in wording CBM calibrated better than this file's.
+ * Injecting 2988 bytes of a contradicting instruction every turn to restate it
+ * is not a trade worth making, so the body stays available and stops being
+ * mandatory.
  *
  * The description is derived from the body rather than written here, so it
  * follows the executable like everything else this pipeline ships.
@@ -277,13 +290,7 @@ export function transformRule(source: string): Artifact {
   const artifact: Artifact = {
     kind: "rule",
     path: RULE_PATH,
-    content: withFrontmatter(
-      [
-        ["description", quote(description)],
-        ["alwaysApply", "true"],
-      ],
-      source,
-    ),
+    content: withFrontmatter([["description", quote(description)]], source),
   };
   guardArtifact(artifact);
   return artifact;
@@ -384,11 +391,18 @@ export function guardArtifact(artifact: Artifact): void {
       return;
     }
     case "rule": {
-      const hasAlwaysApply = document.values.get("alwaysApply")?.trim() === "true";
-      if (!hasAlwaysApply && scalar(document, "description") === null) {
+      if (scalar(document, "description") === null) {
         throw new HarvestError(
-          `${path}: a rule with neither \`alwaysApply\` nor a \`description\` lands in no bucket, is never ` +
-            "injected, and is not addressable through `rule://`",
+          `${path}: a rule with no \`description\` and no trigger condition lands in no bucket, is never ` +
+            "listed, and is not addressable through `rule://`",
+        );
+      }
+      if (document.values.get("alwaysApply")?.trim() === "true") {
+        throw new HarvestError(
+          `${path}: \`alwaysApply: true\` injects the whole body every turn, where its instruction to always ` +
+            "prefer graph tools over grep/glob/file-search contradicts OMP's own `lsp` and `grep` policy and " +
+            "restates the `instructions` CBM's MCP entry already delivers per session; this rule ships as " +
+            "rulebook-only",
         );
       }
       const file = path.split("/").at(-1) ?? path;

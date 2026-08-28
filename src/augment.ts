@@ -38,6 +38,15 @@ const IDENTIFIER = /[A-Za-z_][A-Za-z0-9_]{2,}/gu;
 /** The most identifiers taken from one pattern, so a long regex cannot become a long query. */
 const QUERY_TOKEN_LIMIT = 4;
 
+/**
+ * Node labels that name a container rather than a definition.
+ *
+ * `name_pattern` matches these like any other node, and the keyword mode this
+ * replaced filtered them upstream. A Module or a Folder is not something the
+ * operator's search found, and its degree is file-level rather than symbol-level.
+ */
+const CONTAINER_LABELS = new Set(["File", "Folder", "Module"]);
+
 /** The coverage status meaning "the index recorded no problem with this path". */
 const CLEAN_COVERAGE = "no_recorded_issue";
 
@@ -198,11 +207,18 @@ export function createAugmenter(deps: AugmentDeps): Augmenter {
 /**
  * Graph symbols matching a search, or `null` when there is nothing to add.
  *
- * `grep` searches by identifier, so its pattern becomes a keyword query --
- * CBM's own full-text search splits camelCase into words, which is what makes a
- * pattern written for a regex engine usable as one. `glob` names files rather
- * than symbols, so its pattern becomes a file filter and the answer is the
- * symbols those files define.
+ * Both tools search by name, so both use `name_pattern`. `grep` supplies the
+ * identifiers its pattern holds; `glob` supplies a path filter and the answer is
+ * the symbols those files define.
+ *
+ * The keyword mode this used first is deliberately abandoned. Measured against
+ * v0.10.8, `query: "resolve"` answers 14 rows including `managedCopy`,
+ * `pathOption`, `OrderCase`, and `Layout` -- symbols whose names hold no
+ * `resolve` at all, surfaced because BM25 indexes docstrings and file names. A
+ * block headed "symbols matching this grep" listing rows the grep did not match
+ * is wrong, and the same query answers flat with a `rank` column in place of
+ * `in`/`out`, so it cannot carry degree either. `name_pattern: "(resolve)"`
+ * answers the 11 rows whose names actually contain it, with degree.
  */
 async function symbolsFor(
   client: GraphClient,
@@ -210,7 +226,7 @@ async function symbolsFor(
   tool: "grep" | "glob",
   input: Readonly<Record<string, unknown>>,
 ): Promise<string | null> {
-  const selector = tool === "grep" ? queryFrom(input["pattern"]) : filePatternFrom(input["path"]);
+  const selector = tool === "grep" ? namePatternFrom(input["pattern"]) : filePatternFrom(input["path"]);
   if (selector === null) return null;
 
   const structured = await client.call("search_graph", {
@@ -223,25 +239,41 @@ async function symbolsFor(
   const rows = readRows(structured);
   if (rows === null || rows.length === 0) return null;
 
-  const lines = rows.slice(0, SYMBOL_LIMIT).map((row) => `- ${row.qualified} (${row.label}) ${row.file}${row.lines}`);
+  // Highest in-degree first: `name_pattern` does not rank, and when the bound
+  // truncates, the symbols most depended on are the ones worth the slots.
+  const ranked = [...rows].sort((left, right) => right.inDegree - left.inDegree).slice(0, SYMBOL_LIMIT);
+  const lines = ranked.map((row) => `- ${row.qualified} (${row.label}) ${row.file}${row.lines}${degreeOf(row)}`);
+  const carriesDegree = ranked.some((row) => row.inDegree >= 0);
   return [
     `Codebase graph — ${lines.length} symbol(s) matching this ${tool} in project ${project}:`,
     ...lines,
-    "Use trace_path or get_code_snippet on a qualified name for callers or exact source.",
+    carriesDegree
+      ? "in/out is selected graph degree, not a caller count; use trace_path for callers or get_code_snippet for source."
+      : "Use trace_path for callers or get_code_snippet for exact source.",
   ].join("\n");
 }
 
+/** The degree suffix for a row, or `""` when the response carried no degree columns. */
+function degreeOf(row: SymbolRow): string {
+  return row.inDegree < 0 ? "" : ` — ${row.inDegree} in / ${row.outDegree} out`;
+}
+
 /**
- * A keyword query built from a grep pattern, or `null` when it holds no
+ * A `name_pattern` built from a grep pattern, or `null` when it holds no
  * identifier.
  *
  * Regex metacharacters are simply not identifier characters, so extracting
- * identifiers discards them without needing to understand the pattern.
+ * identifiers discards them without needing to understand the pattern. The
+ * result is left unanchored, which makes it a substring match on symbol names --
+ * the same thing the operator's `grep` did to lines.
+ *
+ * The identifiers need no escaping: {@link IDENTIFIER} admits only characters
+ * that are literals in a regex.
  */
-function queryFrom(pattern: unknown): { readonly query: string } | null {
+function namePatternFrom(pattern: unknown): { readonly name_pattern: string } | null {
   if (typeof pattern !== "string") return null;
-  const tokens = [...pattern.matchAll(IDENTIFIER)].map((match) => match[0]).slice(0, QUERY_TOKEN_LIMIT);
-  return tokens.length === 0 ? null : { query: tokens.join(" ") };
+  const tokens = [...new Set([...pattern.matchAll(IDENTIFIER)].map((match) => match[0]))].slice(0, QUERY_TOKEN_LIMIT);
+  return tokens.length === 0 ? null : { name_pattern: `(${tokens.join("|")})` };
 }
 
 /**
@@ -272,12 +304,21 @@ function filePatternFrom(value: unknown): { readonly file_pattern: string } | nu
   return like === "%" ? null : { file_pattern: like };
 }
 
-/** One graph row, flattened out of whichever response shape produced it. */
+/**
+ * One graph row, flattened out of whichever response shape produced it.
+ *
+ * `inDegree`/`outDegree` are `-1` when the response carried no degree columns.
+ * They are the graph's selected degree over CALLS, USAGE, CALL_REFERENCE,
+ * INHERITS, and IMPLEMENTS -- not a caller count, which is what `trace_path`
+ * answers -- and the appended text says so.
+ */
 interface SymbolRow {
   readonly qualified: string;
   readonly label: string;
   readonly file: string;
   readonly lines: string;
+  readonly inDegree: number;
+  readonly outDegree: number;
 }
 
 /** Where each field sits in a response's column-ordered rows. `-1` means absent. */
@@ -287,18 +328,20 @@ interface Columns {
   readonly label: number;
   readonly file: number;
   readonly lines: number;
+  readonly in: number;
+  readonly out: number;
 }
 
 /**
  * The rows of a `search_graph` JSON response, in either shape it answers with.
  *
- * The two shapes are not interchangeable and both are needed. A keyword search
- * -- what a `grep` pattern becomes -- answers flat: one `rows` list whose
- * columns are `qn, label, file, lines, rank`, carrying whole qualified names. A
- * pattern search -- what a `glob` becomes -- answers grouped: `groups` each
- * carrying a `qn_prefix` and a `file`, with rows whose columns are
- * `name, label, lines, in, out`. Reading only the grouped shape silently
- * returned nothing for every `grep`, which is the bug this handles.
+ * Both selectors this package sends answer grouped: `groups` each carrying a
+ * `qn_prefix` and a `file`, with rows whose columns are
+ * `name, label, lines, in, out`. The flat shape -- one `rows` list whose columns
+ * are `qn, label, file, lines, rank` -- is what the keyword mode answers, and is
+ * still read because a release that changes which mode answers which shape must
+ * degrade to a row without degree rather than to silence. Reading only the
+ * grouped shape once silently returned nothing for every `grep`.
  *
  * Columns are read by the names the response itself declares rather than by
  * position, so a reordered `cols` cannot silently swap two fields.
@@ -309,7 +352,15 @@ function readRows(structured: unknown): readonly SymbolRow[] | null {
   if (!Array.isArray(declared)) return null;
 
   const at = (key: string): number => declared.indexOf(key);
-  const columns: Columns = { qn: at("qn"), name: at("name"), label: at("label"), file: at("file"), lines: at("lines") };
+  const columns: Columns = {
+    qn: at("qn"),
+    name: at("name"),
+    label: at("label"),
+    file: at("file"),
+    lines: at("lines"),
+    in: at("in"),
+    out: at("out"),
+  };
   if (columns.qn === -1 && columns.name === -1) return null;
 
   const rows: SymbolRow[] = [];
@@ -337,6 +388,12 @@ function readRows(structured: unknown): readonly SymbolRow[] | null {
  * `prefix` and `groupFile` supply what a grouped response keeps on the group
  * rather than on the row; a flat response passes neither and carries both in its
  * own columns.
+ *
+ * Container nodes are dropped. `name_pattern` matches them like anything else --
+ * searching `resolve` answers with the `resolve` Module and the `resolve.ts`
+ * File beside the three real symbols -- and a file or folder is not a definition
+ * the operator's search found. The keyword mode filtered these upstream; this
+ * mode does not, so the filter lives here.
  */
 function collect(
   out: SymbolRow[],
@@ -354,19 +411,27 @@ function collect(
       const value: unknown = row[index];
       return typeof value === "string" ? value : "";
     };
+    const count = (index: number): number => {
+      if (index < 0) return -1;
+      const value: unknown = row[index];
+      return typeof value === "number" && Number.isFinite(value) ? value : -1;
+    };
 
     const bare = cell(columns.name);
     const qualified = columns.qn >= 0 ? cell(columns.qn) : prefix === "" ? bare : `${prefix}.${bare}`;
-    // The File node a directory listing produces is not a symbol; it carries no
-    // definition and naming it would spend a bounded slot on nothing.
     if (qualified === "" || qualified.endsWith("__file__")) continue;
+
+    const label = cell(columns.label) === "" ? "symbol" : cell(columns.label);
+    if (CONTAINER_LABELS.has(label)) continue;
 
     const lines = cell(columns.lines);
     out.push({
       qualified,
-      label: cell(columns.label) === "" ? "symbol" : cell(columns.label),
+      label,
       file: cell(columns.file) === "" ? groupFile : cell(columns.file),
       lines: lines === "" ? "" : `:${lines}`,
+      inDegree: count(columns.in),
+      outDegree: count(columns.out),
     });
   }
 }

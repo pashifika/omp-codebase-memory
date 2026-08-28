@@ -26,6 +26,19 @@ afterEach(async () => {
   await dropScratch(scratch);
 });
 
+/**
+ * The budget for a test that spawns the fake server.
+ *
+ * Measured on this repository: the first execution of a freshly written script
+ * through its `#!/usr/bin/env bun` shebang costs ~340 ms on an idle machine, and
+ * seconds under CPU contention -- and every test here writes a new one, because
+ * the options travel inlined in the script. Bun's 5 s default is therefore a
+ * budget these tests can exhaust on a loaded runner while testing nothing about
+ * the subject, so it is replaced by one generous enough that a timeout means the
+ * client actually hung.
+ */
+const SPAWN_BUDGET_MS = 30_000;
+
 /** A client over a fake server configured by `options`. */
 async function fakeClient(options: FakeGraphOptions, queryTimeoutMs = QUERY_TIMEOUT_MS): Promise<GraphClient> {
   const executable = path.join(scratch.root, "fake-graph");
@@ -54,7 +67,7 @@ describe("a working session", () => {
     } finally {
       client.close();
     }
-  });
+  }, SPAWN_BUDGET_MS);
 
   test("pays the handshake once across several queries", async () => {
     const client = await fakeClient({ tools: { list_projects: { projects: [] } } });
@@ -67,7 +80,7 @@ describe("a working session", () => {
     } finally {
       client.close();
     }
-  });
+  }, SPAWN_BUDGET_MS);
 
   test("reports the server's tool names", async () => {
     const client = await fakeClient({ toolNames: ["search_graph", "list_projects"] });
@@ -76,7 +89,7 @@ describe("a working session", () => {
     } finally {
       client.close();
     }
-  });
+  }, SPAWN_BUDGET_MS);
 
   test("passes no cache-root override, so the daemon's own root is the one used", async () => {
     const client = await fakeClient({ echoEnv: true });
@@ -92,7 +105,7 @@ describe("a working session", () => {
     } finally {
       client.close();
     }
-  });
+  }, SPAWN_BUDGET_MS);
 });
 
 interface FailureCase {
@@ -137,7 +150,7 @@ test.each(failureCases)("$scenario", async ({ options, queryTimeoutMs, warmFirst
   } finally {
     client.close();
   }
-});
+}, SPAWN_BUDGET_MS);
 
 test("an executable that does not exist yields null rather than throwing", async () => {
   const client = openGraphClient(path.join(scratch.root, "absent"), { queryTimeoutMs: 100 });
@@ -159,17 +172,17 @@ test("an executable that does not exist yields null rather than throwing", async
  * handshake continues, and a later one finds the session ready.
  */
 test("a query does not wait for a slow handshake, and a later one succeeds", async () => {
-  const client = await fakeClient(
-    { tools: { list_projects: { projects: [] } }, handshakeDelayMs: 400 },
-    100,
-  );
+  const handshakeDelayMs = 2_000;
+  const client = await fakeClient({ tools: { list_projects: { projects: [] } }, handshakeDelayMs }, 100);
   try {
     const started = performance.now();
     expect(await client.call("list_projects", {})).toBeNull();
     const waited = performance.now() - started;
-    // Its own deadline, not the handshake's: generous enough for a loaded CI
-    // runner, far below the 400 ms the server is holding the handshake for.
-    expect(waited).toBeLessThan(350);
+    // The property is that the query did not wait for the handshake, so the
+    // bound is a fraction of the handshake rather than a multiple of the
+    // deadline. The first call also spawns the process, and process spawn on a
+    // loaded runner is what a bound close to the deadline would race.
+    expect(waited).toBeLessThan(handshakeDelayMs / 2);
 
     // Polled, not slept: the client exposes no readiness signal, and a
     // successful answer *is* readiness. Each attempt is bounded by the same
@@ -183,7 +196,7 @@ test("a query does not wait for a slow handshake, and a later one succeeds", asy
   } finally {
     client.close();
   }
-});
+}, SPAWN_BUDGET_MS);
 
 test("a closed client answers null without starting anything", async () => {
   const client = await fakeClient({ tools: { list_projects: { projects: [] } } });
@@ -192,7 +205,7 @@ test("a closed client answers null without starting anything", async () => {
   // Closing twice is a no-op rather than a throw, because `session_shutdown`
   // can arrive after a failure already tore the session down.
   client.close();
-});
+}, SPAWN_BUDGET_MS);
 
 test("a failed open is not retried, so a declining executable costs one attempt", async () => {
   const client = openGraphClient(path.join(scratch.root, "absent"), { queryTimeoutMs: 100 });

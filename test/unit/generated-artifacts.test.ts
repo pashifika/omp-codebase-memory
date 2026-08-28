@@ -91,11 +91,11 @@ describe("the committed skill", () => {
 });
 
 describe("the committed rule", () => {
-  test("carries a description and alwaysApply, under the fixed rule name", async () => {
+  test("carries a description and no alwaysApply, under the fixed rule name", async () => {
     expect(RULE_PATH).toBe("rules/codebase-memory.md");
     const document = parseDocument(await read(RULE_PATH));
     expect(scalar(document, "description")).not.toBeNull();
-    expect(document.values.get("alwaysApply")?.trim()).toBe("true");
+    expect(document.values.get("alwaysApply")).toBeUndefined();
   });
 
   test("is the only file under rules/, so no second rule can claim the reserved name", async () => {

@@ -79,8 +79,9 @@ function readResult(target: string): ToolResultEvent {
 /**
  * A grouped `search_graph` answer holding one group of `count` symbols.
  *
- * The shape a pattern search returns: the qualified-name prefix and the file
- * live on the group, and each row carries only the bare name.
+ * The shape both selectors return: the qualified-name prefix and the file live
+ * on the group, each row carries the bare name, and `in`/`out` carry the graph's
+ * selected degree. Degree descends with the index so the ranking is observable.
  */
 function symbols(count: number): unknown {
   return {
@@ -89,18 +90,47 @@ function symbols(count: number): unknown {
       {
         qn_prefix: "app.src.a",
         file: "src/a.ts",
-        rows: Array.from({ length: count }, (_, index) => [`symbol${index}`, "Function", "1-2", 0, 0]),
+        rows: Array.from({ length: count }, (_, index) => [
+          `symbol${index}`,
+          "Function",
+          "1-2",
+          count - index,
+          index,
+        ]),
       },
     ],
   };
 }
 
 /**
+ * A grouped answer whose rows are container nodes rather than definitions.
+ *
+ * A name pattern matches a `Module`, a `File`, and a `Folder` like any other
+ * node, and the keyword mode that filtered them upstream is no longer used.
+ */
+const CONTAINERS = {
+  cols: ["name", "label", "lines", "in", "out"],
+  groups: [
+    {
+      qn_prefix: "app.src",
+      file: "src/a.ts",
+      rows: [
+        ["a", "Module", "1-40", 0, 6],
+        ["src", "Folder", "", 0, 0],
+        ["__file__", "File", "", 0, 0],
+      ],
+    },
+  ],
+};
+
+/**
  * A flat `search_graph` answer holding `count` symbols.
  *
- * The shape a keyword search returns, which is what a `grep` pattern becomes.
- * Reading only the grouped shape made every `grep` append nothing while every
- * test passed, so both shapes are fixtured here.
+ * The shape the keyword mode returns, carrying a `rank` column where the
+ * name-pattern mode carries `in` and `out`. Neither selector this package sends
+ * produces it any more, and it stays fixtured because a release that changes
+ * which mode answers which shape must degrade to a row without degree rather
+ * than to silence.
  */
 function flatSymbols(count: number): unknown {
   return {
@@ -214,7 +244,7 @@ const globCases: GlobCase[] = [
 
 describe("what the augmentation adds", () => {
   test("appends matching graph symbols to a grep, leaving its output untouched", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(2) });
+    const under = harness({ list_projects: LISTED, search_graph: symbols(2) });
     const original = [text("src/a.ts:1: hit"), text("src/b.ts:9: hit")];
 
     const result = await under.handle(grepResult("resolveExecutable", original));
@@ -226,23 +256,63 @@ describe("what the augmentation adds", () => {
     under.close();
   });
 
-  test("appends matching graph symbols from a grouped answer too", async () => {
+  test("carries the graph's degree, labelled as degree rather than as callers", async () => {
     const under = harness({ list_projects: LISTED, search_graph: symbols(2) });
+
+    const result = await under.handle(grepResult("resolveExecutable"));
+
+    expect(appendedText(result)).toContain("2 in / 0 out");
+    expect(appendedText(result)).toContain("not a caller count");
+    under.close();
+  });
+
+  test("ranks by in-degree, so a truncating bound keeps the symbols most depended on", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: symbols(3) });
+
+    const result = await under.handle(grepResult("resolveExecutable"));
+    const rows = appendedText(result)
+      .split("\n")
+      .filter((line) => line.startsWith("- "));
+
+    expect(rows.map((line) => /(\d+) in/u.exec(line)?.[1])).toEqual(["3", "2", "1"]);
+    under.close();
+  });
+
+  test("drops container nodes, which a name pattern matches like any other node", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: CONTAINERS });
+
+    expect(await under.handle(grepResult("resolveExecutable"))).toBeUndefined();
+    under.close();
+  });
+
+  test("appends a flat answer without a degree claim, because it carries no degree columns", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(2) });
 
     const result = await under.handle(globResult("src/*.ts"));
 
     expect(appendedText(result)).toContain("app.src.a.symbol0");
-    expect(appendedText(result)).toContain("src/a.ts");
+    expect(appendedText(result)).not.toContain(" in / ");
+    expect(appendedText(result)).not.toContain("not a caller count");
     under.close();
   });
 
-  test("searches the graph by identifier, so a regex pattern is usable as a query", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(1) });
+  test("searches by name pattern rather than by keyword, so an appended row is one the grep matched", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: symbols(1) });
     await under.handle(grepResult("^\\s*(resolveExecutable|readState)\\b"));
 
     const search = under.calls.find((call) => call.tool === "search_graph");
-    expect(search?.args["query"]).toBe("resolveExecutable readState");
+    expect(search?.args["name_pattern"]).toBe("(resolveExecutable|readState)");
+    expect(search?.args["query"]).toBeUndefined();
     expect(search?.args["project"]).toBe(PROJECT.name);
+    under.close();
+  });
+
+  test("deduplicates repeated identifiers, so a bounded pattern is not spent on one name twice", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: symbols(1) });
+    await under.handle(grepResult("readState.*readState"));
+
+    const search = under.calls.find((call) => call.tool === "search_graph");
+    expect(search?.args["name_pattern"]).toBe("(readState)");
     under.close();
   });
 

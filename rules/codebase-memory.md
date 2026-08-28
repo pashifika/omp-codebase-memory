@@ -1,6 +1,5 @@
 ---
 description: "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase."
-alwaysApply: true
 ---
 <!-- codebase-memory-mcp:start -->
 # Codebase Memory

@@ -115,11 +115,11 @@ describe("the rule transform", () => {
     expect(parseDocument(artifact.content).body).toBe(source);
   });
 
-  test("adds the frontmatter that places the rule in the always-apply bucket", async () => {
+  test("adds the frontmatter that places the rule in the rulebook bucket, and no always-apply", async () => {
     const source = await fixture("augment/rules/codebase-memory.md");
     const document = parseDocument(transformRule(source).content);
-    expect(document.keys).toEqual(["description", "alwaysApply"]);
-    expect(document.values.get("alwaysApply")?.trim()).toBe("true");
+    expect(document.keys).toEqual(["description"]);
+    expect(document.values.get("alwaysApply")).toBeUndefined();
   });
 
   test("derives the description from the body's first prose line, past the markers and headings", async () => {
@@ -239,13 +239,18 @@ const guardCases: GuardCase[] = [
     names: "one directory below",
   },
   {
-    scenario: "a rule with neither alwaysApply nor a description is refused",
+    scenario: "a rule with no description is refused",
     artifact: { kind: "rule", path: RULE_PATH, content: "---\nglobs: '*.ts'\n---\nbody\n" },
     names: "no bucket",
   },
   {
+    scenario: "a rule reinstating alwaysApply by hand is refused",
+    artifact: { kind: "rule", path: RULE_PATH, content: "---\ndescription: d\nalwaysApply: true\n---\nbody\n" },
+    names: "rulebook-only",
+  },
+  {
     scenario: "a generated rule named RULES.md is refused",
-    artifact: { kind: "rule", path: "rules/RULES.md", content: "---\nalwaysApply: true\n---\nbody\n" },
+    artifact: { kind: "rule", path: "rules/RULES.md", content: "---\ndescription: d\n---\nbody\n" },
     names: "sticky operator rules",
   },
   {

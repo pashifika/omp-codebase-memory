@@ -70,6 +70,7 @@ var COVERAGE_LIMIT = 8;
 var APPEND_LIMIT_BYTES = 4096;
 var IDENTIFIER = /[A-Za-z_][A-Za-z0-9_]{2,}/gu;
 var QUERY_TOKEN_LIMIT = 4;
+var CONTAINER_LABELS = new Set(["File", "Folder", "Module"]);
 var CLEAN_COVERAGE = "no_recorded_issue";
 var COVERAGE_CAVEAT = "A clean coverage result means no recorded gap, not proof of completeness.";
 function createAugmenter(deps) {
@@ -140,7 +141,7 @@ function createAugmenter(deps) {
   };
 }
 async function symbolsFor(client, project, tool, input) {
-  const selector = tool === "grep" ? queryFrom(input["pattern"]) : filePatternFrom(input["path"]);
+  const selector = tool === "grep" ? namePatternFrom(input["pattern"]) : filePatternFrom(input["path"]);
   if (selector === null)
     return null;
   const structured = await client.call("search_graph", {
@@ -152,19 +153,24 @@ async function symbolsFor(client, project, tool, input) {
   const rows = readRows(structured);
   if (rows === null || rows.length === 0)
     return null;
-  const lines = rows.slice(0, SYMBOL_LIMIT).map((row) => `- ${row.qualified} (${row.label}) ${row.file}${row.lines}`);
+  const ranked = [...rows].sort((left, right) => right.inDegree - left.inDegree).slice(0, SYMBOL_LIMIT);
+  const lines = ranked.map((row) => `- ${row.qualified} (${row.label}) ${row.file}${row.lines}${degreeOf(row)}`);
+  const carriesDegree = ranked.some((row) => row.inDegree >= 0);
   return [
     `Codebase graph \u2014 ${lines.length} symbol(s) matching this ${tool} in project ${project}:`,
     ...lines,
-    "Use trace_path or get_code_snippet on a qualified name for callers or exact source."
+    carriesDegree ? "in/out is selected graph degree, not a caller count; use trace_path for callers or get_code_snippet for source." : "Use trace_path for callers or get_code_snippet for exact source."
   ].join(`
 `);
 }
-function queryFrom(pattern) {
+function degreeOf(row) {
+  return row.inDegree < 0 ? "" : ` \u2014 ${row.inDegree} in / ${row.outDegree} out`;
+}
+function namePatternFrom(pattern) {
   if (typeof pattern !== "string")
     return null;
-  const tokens = [...pattern.matchAll(IDENTIFIER)].map((match) => match[0]).slice(0, QUERY_TOKEN_LIMIT);
-  return tokens.length === 0 ? null : { query: tokens.join(" ") };
+  const tokens = [...new Set([...pattern.matchAll(IDENTIFIER)].map((match) => match[0]))].slice(0, QUERY_TOKEN_LIMIT);
+  return tokens.length === 0 ? null : { name_pattern: `(${tokens.join("|")})` };
 }
 function filePatternFrom(value) {
   if (typeof value !== "string")
@@ -182,7 +188,15 @@ function readRows(structured) {
   if (!Array.isArray(declared))
     return null;
   const at = (key) => declared.indexOf(key);
-  const columns = { qn: at("qn"), name: at("name"), label: at("label"), file: at("file"), lines: at("lines") };
+  const columns = {
+    qn: at("qn"),
+    name: at("name"),
+    label: at("label"),
+    file: at("file"),
+    lines: at("lines"),
+    in: at("in"),
+    out: at("out")
+  };
   if (columns.qn === -1 && columns.name === -1)
     return null;
   const rows = [];
@@ -218,16 +232,27 @@ function collect(out, rows, columns, prefix, groupFile) {
       const value = row[index];
       return typeof value === "string" ? value : "";
     };
+    const count = (index) => {
+      if (index < 0)
+        return -1;
+      const value = row[index];
+      return typeof value === "number" && Number.isFinite(value) ? value : -1;
+    };
     const bare = cell(columns.name);
     const qualified = columns.qn >= 0 ? cell(columns.qn) : prefix === "" ? bare : `${prefix}.${bare}`;
     if (qualified === "" || qualified.endsWith("__file__"))
       continue;
+    const label = cell(columns.label) === "" ? "symbol" : cell(columns.label);
+    if (CONTAINER_LABELS.has(label))
+      continue;
     const lines = cell(columns.lines);
     out.push({
       qualified,
-      label: cell(columns.label) === "" ? "symbol" : cell(columns.label),
+      label,
       file: cell(columns.file) === "" ? groupFile : cell(columns.file),
-      lines: lines === "" ? "" : `:${lines}`
+      lines: lines === "" ? "" : `:${lines}`,
+      inDegree: count(columns.in),
+      outDegree: count(columns.out)
     });
   }
 }

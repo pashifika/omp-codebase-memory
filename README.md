@@ -33,9 +33,9 @@ and a `grep` that missed a structural answer gets it appended anyway.
   uninstall. No other user file is touched.
 - **Tracks versions without fighting CBM's own updater.** A managed copy is
   updated by this package. An adopted system copy is only reported on.
-- **Ships a skill, an always-apply rule, and three agents.** All four are
-  derived from the CBM executable rather than written by hand, so the guidance a
-  session gets is the guidance that release actually documents.
+- **Ships a skill, a rulebook rule, and three agents.** All four are derived
+  from the CBM executable rather than written by hand, so the guidance a session
+  gets is the guidance that release actually documents.
 - **Appends graph context to searches and reads.** Matching symbols on a `grep`
   or `glob`, index-coverage gaps on a `read`. Optional, bounded, and it can only
   ever add.
@@ -65,11 +65,12 @@ The catalog lives at `.omp-plugin/marketplace.json`. Marketplace installs are
 discovered through a different provider than git installs, so this is an
 additional entry point rather than a replacement.
 
-That provider contributes skills and agents, and it is not a rules provider. So
-a marketplace install does not receive the always-apply rule. The skill, the
-three agents, the MCP entry, and the augmentation all work on both routes; only
-the rule differs. Use the git spec if you want the graph reminder present in
-every turn without the model having to read a skill first.
+That provider contributes skills and agents, and it is not a rules provider, so
+a marketplace install does not receive the rule. Since the rule is a rulebook
+entry rather than an always-apply injection, what it costs a session either way
+is one listed name and description, and the skill carries the same guidance in
+full. The skill, the three agents, the MCP entry, and the augmentation all work
+on both routes.
 
 ### Development
 
@@ -132,9 +133,19 @@ shadow one of OMP's own bundled agents.
 ### The augmentation feature
 
 `graph-augmentation` is a manifest feature, enabled by default. When it is
-active, a `grep` or `glob` result gains the graph symbols matching the search,
-and a `read` gains the index's coverage findings for that file — but only when
-coverage reports a gap, so a fully indexed file reads exactly as it did before.
+active, a `grep` or `glob` result gains the graph symbols whose names hold one of
+the identifiers the search used, and a `read` gains the index's coverage findings
+for that file — but only when coverage reports a gap, so a fully indexed file
+reads exactly as it did before.
+
+Each appended symbol carries its qualified name, label, file, line range, and the
+graph's degree, written `11 in / 14 out`. The degree is the part worth the
+tokens: a file and line range for a symbol your search already matched is mostly
+a restatement, and `lsp` gives it more precisely where a language server exists,
+but how many edges reach a symbol is not something `grep`, `glob`, or
+`lsp references` can tell you. It is CBM's selected degree over CALLS, USAGE,
+CALL_REFERENCE, INHERITS, and IMPLEMENTS — not a caller count. Use `trace_path`
+for callers; it is also the only tool here that answers transitively.
 
 Install without it, or turn it off later:
 
