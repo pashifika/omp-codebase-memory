@@ -26,7 +26,8 @@ The working tree contains two independent Git repositories:
   `test/`, `dist/`, `package.json`, and `.omp-plugin/`.
 - `rasen/` tracks planning artifacts in its own repository and remote.
 
-`rasen/` is ignored by the outer repository. Commit its work with
+`rasen/` is ignored by the outer repository, so `git status` at the root never
+reports its state and it has to be inspected on its own. Commit its work with
 `git -C rasen`; never stage planning and implementation in the same repository.
 
 ## Git workflow
@@ -38,15 +39,17 @@ landed this way: `feat/graph-context-and-agents`,
 `docs/repository-guidelines`, `chore/commit-ruleset-payloads`.
 
 The default branch and release tags are protected by the rulesets committed
-under `.github/rulesets/`. This section states two things and no more. First,
-the shape of that protection: the facts whose change would change how work lands
-here. Second, the two literals another file in this repository must match — the
-required check name `ci`, which is the gate job's own name in `ci.yml`, and the
-tag pattern `v*`, which a pushed tag and the catalog's `source.ref` must
-satisfy. Everything else those files configure is theirs to state: approval
-counts, the review and bypass booleans, the actor lists, and every other
-parameter. Read a value there rather than trusting one repeated in prose. The
-shape:
+under `.github/rulesets/`. This paragraph and the list below it state two things
+and no more. First, the shape of that protection: the facts whose change would
+change how work lands here — what a contributor must do, which button merges,
+whether a branch must be current first. Second, the two literals another file in
+this repository must match: the required check name `ci`, which is the gate
+job's own name in `ci.yml`, and the tag pattern `v*`, which a pushed tag and
+`.omp-plugin/marketplace.json`'s `source.ref` must satisfy. Nothing verifies
+either agreement mechanically, which is why those two are stated here at all.
+Everything that can move without changing the procedure stays in the rulesets —
+approval counts, the actor and bypass lists, the exemptions — so read a value
+there rather than trusting one repeated in prose. The shape:
 
 - The default branch rejects deletion and non-fast-forward pushes.
 - Landing a change requires a pull request whose review threads are resolved.

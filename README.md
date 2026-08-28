@@ -180,10 +180,13 @@ CBM configuration key for you.
 Resolution order is **pin, `PATH`, `~/.local/bin`, managed copy** — system
 before managed, and the reason is the index rather than tidiness.
 
-CBM keeps one cache root per account, holding one graph, and two executables of
-different versions do not share it safely. Giving a managed copy a root of its
-own would trade that for re-indexing every repository a second time — hours of
-work on a large tree, and gigabytes to hold the same answers twice.
+CBM keeps one cache root per account, holding one graph. A second CBM pointed at
+a root of its own will not start while yours is live: it reports that the active
+account daemon is using a different cache directory, and tells you to close
+every CBM session and command before retrying. So a managed copy with a root of
+its own would buy nothing — it could not run while your installation does, and
+filling that root would mean re-indexing every repository a second time: hours
+of work on a large tree, and gigabytes to hold the same answers twice.
 
 So your existing installation wins. The cost is that this package cannot
 guarantee a version, and that cost is visible rather than hidden: `/cbm status`
@@ -191,8 +194,8 @@ names the source, and an out-of-date system copy produces a pointer to CBM's own
 `update` instead of an attempt to perform it.
 
 `/cbm install` while a system copy resolves is still possible — it is your
-machine — but it explains the shared-cache-root consequence and requires an
-explicit confirmation first.
+machine — but it explains the cache-root hazard above and requires an explicit
+confirmation first.
 
 ## Graph context in a session
 
@@ -274,8 +277,9 @@ again every time.
 - **CBM's configuration.** No account-wide CBM key is ever set for you.
 - **CBM's graph, index, watcher, and cache root.** All CBM's, shared with every
   other client on the account.
-- **Your tool calls.** The augmentation registers no `tool_call` handler; it
-  only ever sees a result the tool already produced.
+- **Your tool calls.** The augmentation registers no `tool_call` handler, so it
+  can never refuse or delay one; it only adds to a result the tool already
+  produced.
 
 ## Staying in step with CBM
 
@@ -327,9 +331,9 @@ regenerates nothing on your machine.
   immediately and you are told the session needs `/mcp reload`.
 - **A foreign entry of the same name is left alone.** CBM's own installer,
   another tool, or a hand edit may already own the `codebase-memory-mcp` key.
-- **`mcp.json` has two possible writers.** OMP's `/mcp add` and this package can
-  both write it. The worst outcome is a lost entry that the next session start
-  rewrites — never a corrupted file.
+- **`mcp.json` has two possible writers.** OMP's `/mcp add` and this package
+  write the same file and share no lock. The worst outcome is a lost entry that
+  the next session start rewrites — never a corrupted file.
 - **Windows is unsupported.** It needs zip extraction, a different executable
   suffix, and its own path handling. It is one explicit
   unsupported-platform error rather than a half-implemented branch.
