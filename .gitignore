@@ -7,6 +7,12 @@ node_modules/
 # byte-identical to a fresh build -- so `dist/` as a whole is NOT ignored.
 *.tsbuildinfo
 
+# `AGENTS.md` is a tracked symlink to `CLAUDE.md`, so both agent tool families
+# read one file and cannot drift. The global ignore excludes `AGENTS.md` as
+# tooling noise; in this repository it is content, so the exclusion is reversed
+# here.
+!AGENTS.md
+
 # Editor and OS noise.
 .DS_Store
 .idea/
