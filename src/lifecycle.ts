@@ -108,6 +108,69 @@ export async function status(lifecycle: Lifecycle): Promise<StatusReport> {
 }
 
 /**
+ * How a lifecycle operation asks the operator a yes/no question.
+ *
+ * An interface rather than a direct `ctx.ui.confirm` call so the decision that
+ * needs the answer lives here, under test, instead of in the extension entry
+ * where the only way to reach it is a real session. `available` is `ctx.hasUI`:
+ * when there is no interactive UI the operation must report why and stop, never
+ * block on an answer that cannot arrive.
+ */
+export interface Confirmer {
+  readonly available: boolean;
+  ask(title: string, message: string): Promise<boolean>;
+}
+
+/**
+ * The hazard `/cbm install` must explain before a second executable exists.
+ *
+ * CBM resolves one canonical per-account cache root and refuses to run when a
+ * process is configured with a different root while another CBM session is
+ * active, so two executables of different versions produce mismatched index
+ * generations. An operator who already has a working installation should learn
+ * that before the second one exists, not after.
+ */
+export async function installHazard(lifecycle: Lifecycle): Promise<string | null> {
+  const resolution = await resolveExecutable(lifecycle.host, await readState(lifecycle.host));
+  if (!resolution.ok || resolution.resolved.source !== "system") return null;
+
+  return (
+    `${resolution.resolved.executable} already resolves (${resolution.resolved.origin}). ` +
+    "CBM resolves one canonical cache root per account and refuses to run when a process is " +
+    "configured with a different root while another CBM session is active, so a second executable " +
+    "of a different version produces mismatched index generations. Adopting the installation you " +
+    "already have is the safe default."
+  );
+}
+
+/**
+ * `install`, gated on explicit confirmation when a system copy already resolves.
+ *
+ * With no interactive UI this reports the hazard and downloads nothing rather
+ * than waiting: no command here may block on input that cannot arrive.
+ */
+export async function confirmedInstall(
+  lifecycle: Lifecycle,
+  version: string | undefined,
+  confirmer: Confirmer,
+): Promise<ActionReport> {
+  const hazard = await installHazard(lifecycle);
+  if (hazard === null) return await install(lifecycle, version);
+
+  if (!confirmer.available) {
+    return {
+      ok: false,
+      message: `${hazard} This session has no interactive UI, so the confirmation this needs cannot be asked; nothing was downloaded.`,
+    };
+  }
+
+  const confirmed = await confirmer.ask("Install a second codebase-memory-mcp?", hazard);
+  return confirmed
+    ? await install(lifecycle, version)
+    : { ok: true, message: `${hazard} Nothing was downloaded.` };
+}
+
+/**
  * Acquires a version, adopts it, and points the MCP entry at it.
  *
  * The pointer is only advanced once the copy is on disk, and resolution is then

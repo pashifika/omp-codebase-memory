@@ -3,12 +3,10 @@ import { existsSync } from "node:fs";
 import { hostTarget, UnsupportedPlatformError } from "./platform.ts";
 import { nativeExtensionPath, processHost } from "./paths.ts";
 import { githubReleaseSource } from "./release.ts";
-import { resolveExecutable } from "./resolve.ts";
-import { readState } from "./state.ts";
 import { schedulerFrom } from "./scheduler.ts";
 import {
   checkUpstream,
-  install,
+  confirmedInstall,
   pin,
   status,
   syncEntry,
@@ -16,6 +14,7 @@ import {
   unpin,
   update,
   type ActionReport,
+  type Confirmer,
   type Lifecycle,
 } from "./lifecycle.ts";
 
@@ -156,7 +155,7 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
           return;
         }
         case "install":
-          report(ctx, await runInstall(ctx, lifecycle, rest[0]));
+          report(ctx, await confirmedInstall(lifecycle, rest[0], confirmerFrom(ctx)));
           return;
         case "update":
           report(ctx, await update(lifecycle));
@@ -188,49 +187,17 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
   });
 
   /**
-   * Acquires a managed copy, with the shared-cache-root hazard made explicit.
+   * Adapts one command context to the lifecycle's confirmation seam.
    *
-   * The confirmation is not a formality. CBM resolves one canonical per-account
-   * cache root and refuses to run when a process is configured with a different
-   * root while any CBM session or command is active, so two executables of
-   * different versions produce mismatched index generations. An operator who
-   * already has a working installation should be told that before a second one
-   * exists, not after.
-   *
-   * With no interactive UI the command fails with that reason rather than
-   * waiting: nothing here may block on input that cannot arrive.
+   * The decision that needs the answer -- whether a second executable is a
+   * hazard, what to tell the operator, and what to do when no UI exists -- lives
+   * in `confirmedInstall`, where a test can reach it. This is the whole of the
+   * translation.
    */
-  const runInstall = async (
-    ctx: ExtensionCommandContext,
-    active: Lifecycle,
-    version: string | undefined,
-  ): Promise<ActionReport> => {
-    const resolution = await resolveExecutable(active.host, await readState(active.host));
-    const hazard =
-      resolution.ok && resolution.resolved.source === "system"
-        ? `${resolution.resolved.executable} already resolves (${resolution.resolved.origin}).`
-        : null;
-
-    if (hazard !== null) {
-      const explanation =
-        `${hazard} CBM resolves one canonical cache root per account and refuses to run when a ` +
-        "process is configured with a different root while another CBM session is active, so a " +
-        "second executable of a different version produces mismatched index generations. " +
-        "Adopting the installation you already have is the safe default.";
-
-      if (!ctx.hasUI) {
-        return {
-          ok: false,
-          message: `${explanation} This session has no interactive UI, so the confirmation this needs cannot be asked; nothing was downloaded.`,
-        };
-      }
-
-      const confirmed = await ctx.ui.confirm("Install a second codebase-memory-mcp?", explanation);
-      if (!confirmed) return { ok: true, message: `${explanation} Nothing was downloaded.` };
-    }
-
-    return await install(active, version);
-  };
+  const confirmerFrom = (ctx: ExtensionCommandContext): Confirmer => ({
+    available: ctx.hasUI,
+    ask: (title, message) => ctx.ui.confirm(title, message),
+  });
 
   /**
    * Session start: verify the owned entry, correct it, and never block.

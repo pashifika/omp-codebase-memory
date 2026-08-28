@@ -5,13 +5,16 @@ import path from "node:path";
 import {
   checkUpstream,
   CHECK_INTERVAL_MS,
+  confirmedInstall,
   install,
+  installHazard,
   pin,
   status,
   syncEntry,
   uninstall,
   unpin,
   update,
+  type Confirmer,
   type Lifecycle,
 } from "../../src/lifecycle.ts";
 import { entryStatus } from "../../src/mcp-config.ts";
@@ -246,5 +249,122 @@ describe("status", () => {
   test("names the resolved agent directory so a profile-scoped write is visible", async () => {
     const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource });
     expect(report.lines.join("\n")).toContain(`agent dir:  ${path.join(scratch.home, ".omp/agent")}`);
+  });
+});
+
+/** A confirmer whose answer is fixed, recording whether it was consulted. */
+function fixedConfirmer(available: boolean, answer: boolean): Confirmer & { asked: string[] } {
+  const asked: string[] = [];
+  return {
+    available,
+    asked,
+    ask: async (_title, message) => {
+      asked.push(message);
+      return answer;
+    },
+  };
+}
+
+describe("install is gated on confirmation when a system copy already resolves", () => {
+  test("with nothing resolving there is no hazard and no question is asked", async () => {
+    const confirmer = fixedConfirmer(true, false);
+    expect(await installHazard(await lifecycleFor(VERSION))).toBeNull();
+
+    const report = await confirmedInstall(await lifecycleFor(VERSION), undefined, confirmer);
+    expect(report.ok).toBe(true);
+    expect(confirmer.asked).toEqual([]);
+    expect((await readState(scratch.host)).managedVersion).toBe(VERSION);
+  });
+
+  test("the hazard names the resolved executable and the shared cache root", async () => {
+    await writeFakeExecutable(
+      path.join(scratch.pathDir, EXECUTABLE_NAME),
+      `echo "codebase-memory-mcp 0.9.0"`,
+    );
+
+    const hazard = await installHazard(await lifecycleFor(VERSION));
+    expect(hazard).toContain(path.join(scratch.pathDir, EXECUTABLE_NAME));
+    expect(hazard).toContain("one canonical cache root per account");
+  });
+
+  test("declining downloads nothing", async () => {
+    await writeFakeExecutable(
+      path.join(scratch.pathDir, EXECUTABLE_NAME),
+      `echo "codebase-memory-mcp 0.9.0"`,
+    );
+    const confirmer = fixedConfirmer(true, false);
+
+    const report = await confirmedInstall(await lifecycleFor(VERSION), undefined, confirmer);
+    expect(report.ok).toBe(true);
+    expect(report.message).toContain("Nothing was downloaded");
+    expect(confirmer.asked).toHaveLength(1);
+    expect(await Bun.file(packageRoot(scratch.host)).exists()).toBe(false);
+  });
+
+  test("accepting downloads and adopts a second copy", async () => {
+    await writeFakeExecutable(
+      path.join(scratch.pathDir, EXECUTABLE_NAME),
+      `echo "codebase-memory-mcp 0.9.0"`,
+    );
+    const confirmer = fixedConfirmer(true, true);
+
+    const report = await confirmedInstall(await lifecycleFor(VERSION), undefined, confirmer);
+    expect(report.ok).toBe(true);
+    expect(confirmer.asked).toHaveLength(1);
+    expect((await readState(scratch.host)).managedVersion).toBe(VERSION);
+  });
+
+  /**
+   * The spec is explicit that no command may block on input that cannot arrive.
+   * A session with no interactive UI must therefore report the hazard and stop.
+   */
+  test("with no interactive UI it reports the reason and never asks", async () => {
+    await writeFakeExecutable(
+      path.join(scratch.pathDir, EXECUTABLE_NAME),
+      `echo "codebase-memory-mcp 0.9.0"`,
+    );
+    const confirmer = fixedConfirmer(false, true);
+
+    const report = await confirmedInstall(await lifecycleFor(VERSION), undefined, confirmer);
+    expect(report.ok).toBe(false);
+    expect(report.message).toContain("no interactive UI");
+    expect(report.message).toContain("nothing was downloaded");
+    expect(confirmer.asked).toEqual([]);
+    expect(await Bun.file(packageRoot(scratch.host)).exists()).toBe(false);
+  });
+});
+
+describe("session start with nothing resolving", () => {
+  test("writes no entry and names the install command", async () => {
+    const report = await syncEntry({
+      host: scratch.host,
+      target: TARGET,
+      source: forbiddenSource,
+    });
+
+    expect(report.kind).toBe("unresolved");
+    expect(report.message).toContain("/cbm install");
+    expect(report.message).toContain("No MCP entry was written or changed");
+    expect(await Bun.file(mcpConfigPath(scratch.host)).exists()).toBe(false);
+  });
+
+  test("a pre-existing foreign entry is refused rather than corrected", async () => {
+    const file = mcpConfigPath(scratch.host);
+    const foreign = `{\n  "mcpServers": {\n    "codebase-memory-mcp": {\n      "command": "/opt/homebrew/bin/codebase-memory-mcp"\n    }\n  }\n}\n`;
+    await Bun.write(file, foreign);
+    await writeFakeExecutable(
+      path.join(scratch.pathDir, EXECUTABLE_NAME),
+      `echo "codebase-memory-mcp 0.9.0"`,
+    );
+
+    const report = await syncEntry({
+      host: scratch.host,
+      target: TARGET,
+      source: forbiddenSource,
+    });
+
+    expect(report.kind).toBe("refused");
+    expect(report.message).toContain("/opt/homebrew/bin/codebase-memory-mcp");
+    expect(await Bun.file(file).text()).toBe(foreign);
   });
 });

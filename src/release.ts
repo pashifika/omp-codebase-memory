@@ -69,12 +69,24 @@ export async function fetchHttps(url: string, options: FetchOptions = {}): Promi
     const redirected = response.status >= 300 && response.status < 400;
     if (!redirected || hop >= budget) return response;
 
-    const location = response.headers.get("location");
-    if (location === null) {
-      throw new Error(`${current} answered ${response.status} with no location header`);
-    }
-    current = requireHttps(new URL(location, current).href, "redirect");
+    current = nextHop(current, response.status, response.headers.get("location"));
   }
+}
+
+/**
+ * The URL one redirect hop leads to, or a refusal.
+ *
+ * Separated from {@link fetchHttps} because it is the whole transport-downgrade
+ * defence and the only part of it a test can reach without a TLS origin that
+ * redirects to plain HTTP. A relative `location` is resolved against the URL it
+ * came from, which is also what makes a scheme-relative `//host/path` inherit
+ * HTTPS rather than slip through as protocol-less.
+ */
+export function nextHop(current: string, status: number, location: string | null): string {
+  if (location === null || location === "") {
+    throw new Error(`${current} answered ${status} with no location header`);
+  }
+  return requireHttps(new URL(location, current).href, "redirect");
 }
 
 /** `url` when it is HTTPS; otherwise a refusal naming which hop downgraded. */
@@ -87,29 +99,20 @@ function requireHttps(url: string, kind: "request" | "redirect"): string {
 }
 
 /**
- * The newest release tag, read from the `releases/latest` redirect.
+ * The release tag a `releases/latest` response names.
  *
- * Not the GitHub API: that answer is rate-limited per IP, which turns a
- * background version check into an intermittent failure on a shared network
- * and would need a token for something requiring no authentication at all.
- * The redirect needs neither, and asset downloads already use the same
- * `releases/` mechanism.
- *
- * The `location` is validated rather than trusted. A redirect is attacker-
- * adjacent input, and the tag it yields is later interpolated into a download
- * URL and used as an on-disk directory name.
+ * Separated from {@link resolveLatestTag} for the same reason as
+ * {@link nextHop}: this is validation of attacker-adjacent input -- the tag it
+ * yields is interpolated into a download URL and used as an on-disk directory
+ * name -- and a function is the only way to test the refusals without standing
+ * up a server that impersonates GitHub.
  */
-export async function resolveLatestTag(): Promise<string> {
-  const response = await fetchHttps(LATEST, { maxRedirects: 0 });
-  if (response.status < 300 || response.status >= 400) {
-    throw new Error(
-      `expected ${LATEST} to redirect to a tag, got HTTP ${response.status}`,
-    );
+export function tagFromLocation(status: number, location: string | null): string {
+  if (status < 300 || status >= 400) {
+    throw new Error(`expected ${LATEST} to redirect to a tag, got HTTP ${status}`);
   }
-
-  const location = response.headers.get("location");
-  if (location === null) {
-    throw new Error(`${LATEST} answered ${response.status} with no location header`);
+  if (location === null || location === "") {
+    throw new Error(`${LATEST} answered ${status} with no location header`);
   }
 
   const resolved = new URL(location, LATEST);
@@ -117,8 +120,12 @@ export async function resolveLatestTag(): Promise<string> {
     throw new Error(`refusing non-HTTPS release location: ${resolved.href}`);
   }
 
+  // The origin is checked as well as the path. Without it a redirect to
+  // `https://elsewhere/DeusData/codebase-memory-mcp/releases/tag/v9.9.9` would
+  // be mined for a version string this package then treats as the newest
+  // release -- the path prefix alone says nothing about who answered.
   const prefix = `/${UPSTREAM_REPO}/releases/tag/`;
-  if (!resolved.pathname.startsWith(prefix)) {
+  if (resolved.origin !== new URL(LATEST).origin || !resolved.pathname.startsWith(prefix)) {
     throw new Error(`unexpected release location: ${resolved.href}`);
   }
 
@@ -127,6 +134,20 @@ export async function resolveLatestTag(): Promise<string> {
     throw new Error(`unexpected release tag in location: ${resolved.href}`);
   }
   return tag;
+}
+
+/**
+ * The newest release tag, read from the `releases/latest` redirect.
+ *
+ * Not the GitHub API: that answer is rate-limited per IP, which turns a
+ * background version check into an intermittent failure on a shared network
+ * and would need a token for something requiring no authentication at all.
+ * The redirect needs neither, and asset downloads already use the same
+ * `releases/` mechanism.
+ */
+export async function resolveLatestTag(): Promise<string> {
+  const response = await fetchHttps(LATEST, { maxRedirects: 0 });
+  return tagFromLocation(response.status, response.headers.get("location"));
 }
 
 /**

@@ -120,12 +120,14 @@ async function fetchHttps(url, options = {}) {
     const redirected = response.status >= 300 && response.status < 400;
     if (!redirected || hop >= budget)
       return response;
-    const location = response.headers.get("location");
-    if (location === null) {
-      throw new Error(`${current} answered ${response.status} with no location header`);
-    }
-    current = requireHttps(new URL(location, current).href, "redirect");
+    current = nextHop(current, response.status, response.headers.get("location"));
   }
+}
+function nextHop(current, status, location) {
+  if (location === null || location === "") {
+    throw new Error(`${current} answered ${status} with no location header`);
+  }
+  return requireHttps(new URL(location, current).href, "redirect");
 }
 function requireHttps(url, kind) {
   const parsed = new URL(url);
@@ -134,21 +136,19 @@ function requireHttps(url, kind) {
   }
   return parsed.href;
 }
-async function resolveLatestTag() {
-  const response = await fetchHttps(LATEST, { maxRedirects: 0 });
-  if (response.status < 300 || response.status >= 400) {
-    throw new Error(`expected ${LATEST} to redirect to a tag, got HTTP ${response.status}`);
+function tagFromLocation(status, location) {
+  if (status < 300 || status >= 400) {
+    throw new Error(`expected ${LATEST} to redirect to a tag, got HTTP ${status}`);
   }
-  const location = response.headers.get("location");
-  if (location === null) {
-    throw new Error(`${LATEST} answered ${response.status} with no location header`);
+  if (location === null || location === "") {
+    throw new Error(`${LATEST} answered ${status} with no location header`);
   }
   const resolved = new URL(location, LATEST);
   if (resolved.protocol !== "https:") {
     throw new Error(`refusing non-HTTPS release location: ${resolved.href}`);
   }
   const prefix = `/${UPSTREAM_REPO}/releases/tag/`;
-  if (!resolved.pathname.startsWith(prefix)) {
+  if (resolved.origin !== new URL(LATEST).origin || !resolved.pathname.startsWith(prefix)) {
     throw new Error(`unexpected release location: ${resolved.href}`);
   }
   const tag = decodeURIComponent(resolved.pathname.slice(prefix.length));
@@ -156,6 +156,10 @@ async function resolveLatestTag() {
     throw new Error(`unexpected release tag in location: ${resolved.href}`);
   }
   return tag;
+}
+async function resolveLatestTag() {
+  const response = await fetchHttps(LATEST, { maxRedirects: 0 });
+  return tagFromLocation(response.status, response.headers.get("location"));
 }
 function parseChecksums(body, archive) {
   if (body.byteLength > CHECKSUMS_LIMIT_BYTES) {
@@ -200,6 +204,26 @@ async function download(url) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+// src/scheduler.ts
+function schedulerFrom(ctx) {
+  return {
+    after(callback, ms) {
+      return ctx.setTimeout(callback, ms);
+    },
+    cancel(handle) {
+      ctx.clearTimer(handle);
+    }
+  };
+}
+
+// src/lifecycle.ts
+import { rm as rm2 } from "fs/promises";
+
+// src/acquire.ts
+import { chmod, lstat, mkdtemp, mkdir, rm } from "fs/promises";
+import { tmpdir } from "os";
+import path2 from "path";
+
 // src/exec.ts
 var DEFAULT_TIMEOUT_MS2 = 30000;
 async function run(argv, options = {}) {
@@ -239,123 +263,7 @@ function haveTool(tool, pathEnv) {
   return Bun.which(tool, pathEnv === undefined ? {} : { PATH: pathEnv }) !== null;
 }
 
-// src/state.ts
-import { mkdir } from "fs/promises";
-import path2 from "path";
-var EMPTY = {};
-async function readState(host) {
-  const file = Bun.file(statePath(host));
-  let text;
-  try {
-    text = await file.text();
-  } catch {
-    return EMPTY;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return EMPTY;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
-    return EMPTY;
-  const record = parsed;
-  const state = {};
-  for (const key of ["managedVersion", "managedDigest", "pin", "upstreamVersion", "wroteCommand"]) {
-    const value = record[key];
-    if (typeof value === "string" && value !== "")
-      state[key] = value;
-  }
-  const lastCheckedAt = record["lastCheckedAt"];
-  if (typeof lastCheckedAt === "number" && Number.isFinite(lastCheckedAt)) {
-    state["lastCheckedAt"] = lastCheckedAt;
-  }
-  return state;
-}
-async function writeState(host, next) {
-  const file = statePath(host);
-  await mkdir(path2.dirname(file), { recursive: true });
-  await Bun.write(file, `${JSON.stringify(next, null, 2)}
-`);
-}
-async function updateState(host, patch) {
-  const next = { ...await readState(host), ...patch };
-  await writeState(host, next);
-  return next;
-}
-
-// src/resolve.ts
-import path3 from "path";
-var NO_EXECUTABLE_REASON = `no ${EXECUTABLE_NAME} executable found on PATH, in ~/.local/bin, or under this package's own root. ` + "Run /cbm install to download a managed copy, or install it yourself with " + "`curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash` " + "and this package will adopt it.";
-async function managedCopy(host, state) {
-  const recorded = (state ?? await readState(host)).managedVersion;
-  if (recorded === undefined)
-    return null;
-  const executable = managedExecutable(host, recorded);
-  return await Bun.file(executable).exists() ? { version: recorded, executable } : null;
-}
-async function resolveExecutable(host, state) {
-  const current = state ?? await readState(host);
-  const pin = current.pin;
-  if (pin !== undefined) {
-    const pinned = managedExecutable(host, pin);
-    if (await Bun.file(pinned).exists()) {
-      return { ok: true, resolved: { executable: pinned, source: "pin", origin: pin } };
-    }
-  }
-  const onPath = Bun.which(EXECUTABLE_NAME, pathOption(host));
-  if (onPath !== null) {
-    return {
-      ok: true,
-      resolved: { executable: path3.resolve(onPath), source: "system", origin: "PATH" }
-    };
-  }
-  const upstream = path3.join(upstreamInstallDir(host), EXECUTABLE_NAME);
-  if (await Bun.file(upstream).exists()) {
-    return {
-      ok: true,
-      resolved: { executable: upstream, source: "system", origin: "~/.local/bin" }
-    };
-  }
-  const managed = await managedCopy(host, current);
-  if (managed !== null) {
-    return {
-      ok: true,
-      resolved: {
-        executable: managed.executable,
-        source: "managed",
-        origin: path3.join(path3.basename(managedBinRoot(host)), managed.version)
-      }
-    };
-  }
-  return { ok: false, reason: NO_EXECUTABLE_REASON };
-}
-async function resolvedVersion(resolved) {
-  return await readVersion(resolved.executable);
-}
-function pathOption(host) {
-  return { PATH: host.env["PATH"] ?? "" };
-}
-
-// src/scheduler.ts
-function schedulerFrom(ctx) {
-  return {
-    after(callback, ms) {
-      return ctx.setTimeout(callback, ms);
-    },
-    cancel(handle) {
-      ctx.clearTimer(handle);
-    }
-  };
-}
-
-// src/lifecycle.ts
-import { rm as rm2 } from "fs/promises";
-
 // src/acquire.ts
-import { chmod, lstat, mkdtemp, mkdir as mkdir2, rm } from "fs/promises";
-import { tmpdir } from "os";
-import path4 from "path";
 var VERSION_PATTERN = /^[0-9][0-9A-Za-z.+-]*$/u;
 function normalizeVersion(value) {
   const trimmed = value.trim().replace(/^v/iu, "");
@@ -385,13 +293,13 @@ async function acquire(request) {
   if (actual !== expected) {
     throw new Error(`SHA-256 mismatch for ${target.archive} at ${tag}: published ${expected}, downloaded ${actual}`);
   }
-  const scratch = await mkdtemp(path4.join(tmpdir(), "omp-codebase-memory-"));
+  const scratch = await mkdtemp(path2.join(tmpdir(), "omp-codebase-memory-"));
   try {
-    const archive = path4.join(scratch, target.archive);
+    const archive = path2.join(scratch, target.archive);
     await Bun.write(archive, bytes);
     await assertArchiveMembers(archive, target);
     await extract(archive, scratch, target);
-    const candidate = path4.join(scratch, target.executable);
+    const candidate = path2.join(scratch, target.executable);
     await chmod(candidate, 493);
     if (target.os === "darwin")
       await repairMacOsSignature(host, candidate);
@@ -404,7 +312,7 @@ async function acquire(request) {
 async function assertArchiveMembers(archive, target) {
   const listed = await run(["tar", "-tzf", archive]);
   if (!listed.ok) {
-    throw new Error(`could not enumerate ${path4.basename(archive)}: ${listed.stderr.trim() || listed.spawnError || `tar exited ${listed.exitCode}`}`);
+    throw new Error(`could not enumerate ${path2.basename(archive)}: ${listed.stderr.trim() || listed.spawnError || `tar exited ${listed.exitCode}`}`);
   }
   const seen = new Map;
   for (const raw of listed.stdout.split(`
@@ -427,10 +335,10 @@ async function assertArchiveMembers(archive, target) {
 async function extract(archive, into, target) {
   const extracted = await run(["tar", "--no-same-owner", "-xzf", archive, "-C", into]);
   if (!extracted.ok) {
-    throw new Error(`could not extract ${path4.basename(archive)}: ${extracted.stderr.trim() || extracted.spawnError || `tar exited ${extracted.exitCode}`}`);
+    throw new Error(`could not extract ${path2.basename(archive)}: ${extracted.stderr.trim() || extracted.spawnError || `tar exited ${extracted.exitCode}`}`);
   }
   for (const member of target.members) {
-    const entry = path4.join(into, member);
+    const entry = path2.join(into, member);
     let stats;
     try {
       stats = await lstat(entry);
@@ -468,9 +376,9 @@ async function smokeCheck(candidate, target) {
   throw new Error(`the downloaded executable failed to run \`--version\`.${suffix}`);
 }
 async function adopt(host, candidate) {
-  const destination = path4.join(managedBinRoot(host), candidate.version);
-  await mkdir2(destination, { recursive: true });
-  const executable = path4.join(destination, path4.basename(candidate.candidate));
+  const destination = path2.join(managedBinRoot(host), candidate.version);
+  await mkdir(destination, { recursive: true });
+  const executable = path2.join(destination, path2.basename(candidate.candidate));
   await Bun.write(executable, Bun.file(candidate.candidate));
   await chmod(executable, 493);
   return {
@@ -482,8 +390,8 @@ async function adopt(host, candidate) {
 }
 
 // src/mcp-config.ts
-import { mkdir as mkdir3 } from "fs/promises";
-import path5 from "path";
+import { mkdir as mkdir2 } from "fs/promises";
+import path3 from "path";
 var MCP_SCHEMA_URL = "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json";
 async function readMcpFile(host) {
   const file = mcpConfigPath(host);
@@ -550,7 +458,7 @@ async function upsertEntry(host, command, previouslyWrote) {
   const rendered = render(next, file);
   if (file.text === rendered)
     return { ok: true, change: "unchanged" };
-  await mkdir3(path5.dirname(file.path), { recursive: true });
+  await mkdir2(path3.dirname(file.path), { recursive: true });
   await Bun.write(file.path, rendered);
   return { ok: true, change: file.text === null ? "created" : "updated" };
 }
@@ -615,6 +523,104 @@ function render(document, file) {
 ` : body;
 }
 
+// src/state.ts
+import { mkdir as mkdir3 } from "fs/promises";
+import path4 from "path";
+var EMPTY = {};
+async function readState(host) {
+  const file = Bun.file(statePath(host));
+  let text;
+  try {
+    text = await file.text();
+  } catch {
+    return EMPTY;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return EMPTY;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return EMPTY;
+  const record = parsed;
+  const state = {};
+  for (const key of ["managedVersion", "managedDigest", "pin", "upstreamVersion", "wroteCommand"]) {
+    const value = record[key];
+    if (typeof value === "string" && value !== "")
+      state[key] = value;
+  }
+  const lastCheckedAt = record["lastCheckedAt"];
+  if (typeof lastCheckedAt === "number" && Number.isFinite(lastCheckedAt)) {
+    state["lastCheckedAt"] = lastCheckedAt;
+  }
+  return state;
+}
+async function writeState(host, next) {
+  const file = statePath(host);
+  await mkdir3(path4.dirname(file), { recursive: true });
+  await Bun.write(file, `${JSON.stringify(next, null, 2)}
+`);
+}
+async function updateState(host, patch) {
+  const next = { ...await readState(host), ...patch };
+  await writeState(host, next);
+  return next;
+}
+
+// src/resolve.ts
+import path5 from "path";
+var NO_EXECUTABLE_REASON = `no ${EXECUTABLE_NAME} executable found on PATH, in ~/.local/bin, or under this package's own root. ` + "Run /cbm install to download a managed copy, or install it yourself with " + "`curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash` " + "and this package will adopt it.";
+async function managedCopy(host, state) {
+  const recorded = (state ?? await readState(host)).managedVersion;
+  if (recorded === undefined)
+    return null;
+  const executable = managedExecutable(host, recorded);
+  return await Bun.file(executable).exists() ? { version: recorded, executable } : null;
+}
+async function resolveExecutable(host, state) {
+  const current = state ?? await readState(host);
+  const pin = current.pin;
+  if (pin !== undefined) {
+    const pinned = managedExecutable(host, pin);
+    if (await Bun.file(pinned).exists()) {
+      return { ok: true, resolved: { executable: pinned, source: "pin", origin: pin } };
+    }
+  }
+  const onPath = Bun.which(EXECUTABLE_NAME, pathOption(host));
+  if (onPath !== null) {
+    return {
+      ok: true,
+      resolved: { executable: path5.resolve(onPath), source: "system", origin: "PATH" }
+    };
+  }
+  const upstream = path5.join(upstreamInstallDir(host), EXECUTABLE_NAME);
+  if (await Bun.file(upstream).exists()) {
+    return {
+      ok: true,
+      resolved: { executable: upstream, source: "system", origin: "~/.local/bin" }
+    };
+  }
+  const managed = await managedCopy(host, current);
+  if (managed !== null) {
+    return {
+      ok: true,
+      resolved: {
+        executable: managed.executable,
+        source: "managed",
+        origin: path5.join(path5.basename(managedBinRoot(host)), managed.version)
+      }
+    };
+  }
+  return { ok: false, reason: NO_EXECUTABLE_REASON };
+}
+async function resolvedVersion(resolved) {
+  return await readVersion(resolved.executable);
+}
+function pathOption(host) {
+  return { PATH: host.env["PATH"] ?? "" };
+}
+
 // src/lifecycle.ts
 var CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 async function status(lifecycle) {
@@ -645,6 +651,25 @@ async function status(lifecycle) {
     lines.push(`mcp entry:  ${entry.current ? "current" : `stale, names ${entry.command ?? "(no command)"}`} in ${entry.path}`);
   }
   return { lines, resolved };
+}
+async function installHazard(lifecycle) {
+  const resolution = await resolveExecutable(lifecycle.host, await readState(lifecycle.host));
+  if (!resolution.ok || resolution.resolved.source !== "system")
+    return null;
+  return `${resolution.resolved.executable} already resolves (${resolution.resolved.origin}). ` + "CBM resolves one canonical cache root per account and refuses to run when a process is " + "configured with a different root while another CBM session is active, so a second executable " + "of a different version produces mismatched index generations. Adopting the installation you " + "already have is the safe default.";
+}
+async function confirmedInstall(lifecycle, version, confirmer) {
+  const hazard = await installHazard(lifecycle);
+  if (hazard === null)
+    return await install(lifecycle, version);
+  if (!confirmer.available) {
+    return {
+      ok: false,
+      message: `${hazard} This session has no interactive UI, so the confirmation this needs cannot be asked; nothing was downloaded.`
+    };
+  }
+  const confirmed = await confirmer.ask("Install a second codebase-memory-mcp?", hazard);
+  return confirmed ? await install(lifecycle, version) : { ok: true, message: `${hazard} Nothing was downloaded.` };
 }
 async function install(lifecycle, version) {
   const { host } = lifecycle;
@@ -868,7 +893,7 @@ function ompCodebaseMemory(pi) {
           return;
         }
         case "install":
-          report(ctx, await runInstall(ctx, lifecycle, rest[0]));
+          report(ctx, await confirmedInstall(lifecycle, rest[0], confirmerFrom(ctx)));
           return;
         case "update":
           report(ctx, await update(lifecycle));
@@ -889,23 +914,10 @@ function ompCodebaseMemory(pi) {
       }
     }
   });
-  const runInstall = async (ctx, active, version) => {
-    const resolution = await resolveExecutable(active.host, await readState(active.host));
-    const hazard = resolution.ok && resolution.resolved.source === "system" ? `${resolution.resolved.executable} already resolves (${resolution.resolved.origin}).` : null;
-    if (hazard !== null) {
-      const explanation = `${hazard} CBM resolves one canonical cache root per account and refuses to run when a ` + "process is configured with a different root while another CBM session is active, so a " + "second executable of a different version produces mismatched index generations. " + "Adopting the installation you already have is the safe default.";
-      if (!ctx.hasUI) {
-        return {
-          ok: false,
-          message: `${explanation} This session has no interactive UI, so the confirmation this needs cannot be asked; nothing was downloaded.`
-        };
-      }
-      const confirmed = await ctx.ui.confirm("Install a second codebase-memory-mcp?", explanation);
-      if (!confirmed)
-        return { ok: true, message: `${explanation} Nothing was downloaded.` };
-    }
-    return await install(active, version);
-  };
+  const confirmerFrom = (ctx) => ({
+    available: ctx.hasUI,
+    ask: (title, message) => ctx.ui.confirm(title, message)
+  });
   pi.on("session_start", async (_event, ctx) => {
     if (lifecycle === null)
       return;
