@@ -38,8 +38,11 @@ This package is the missing path. `omp plugin install` is the whole setup step.
 omp plugin install github:pashifika/omp-codebase-memory
 ```
 
-This is the command CI installs into a scratch project on every push, so it is
-verified against the exact ref you type.
+CI runs this command, through OMP's own installer, on pushes to `main`, on
+release tag pushes, and on manual dispatch — as
+`github:pashifika/omp-codebase-memory#<ref>`, into a home directory with no
+prior plugin state. `omp plugin install` validates what it installed by loading
+the declared extension entry, so a ref that installs green also registers green.
 
 ### Marketplace
 
@@ -65,6 +68,11 @@ omp plugin link .
 loads without a build step. Run `bun run build` after changing anything under
 `src/`; CI fails if the committed bundle is not byte-identical to one built from
 the current source.
+
+CI links its own checkout with this command, so the development install is
+verified to be discovered. That the committed bundle then *loads* through OMP's
+loader is `test/packaging/bundle.test.ts` — `omp plugin link` registers a
+checkout without loading it.
 
 ## Commands
 
