@@ -151,8 +151,8 @@ describe("the base bundle", () => {
 });
 
 describe("the feature bundle", () => {
-  test("registers the tool_result handler and the shutdown that releases its graph session", async () => {
-    expect(await handlersOf(FEATURE_BUNDLE)).toEqual(["session_shutdown", "tool_result"]);
+  test("registers tool_result, the warm-up, and the shutdown that releases its graph session", async () => {
+    expect(await handlersOf(FEATURE_BUNDLE)).toEqual(["session_shutdown", "session_start", "tool_result"]);
   });
 
   test("registers no command and no tools, because it is one handler and nothing else", async () => {

@@ -4,6 +4,7 @@ import { createAugmenter } from "./augment.ts";
 import { openGraphClient } from "./graph.ts";
 import { nativeExtensionPath, processHost } from "./paths.ts";
 import { resolveExecutable } from "./resolve.ts";
+import { schedulerFrom } from "./scheduler.ts";
 import { readState } from "./state.ts";
 
 import type { Augmenter } from "./augment.ts";
@@ -19,10 +20,25 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
  * feature is active" has to be a property of which file gets loaded, not of a
  * runtime check.
  *
- * Registers `tool_result` and `session_shutdown`, and never `tool_call`: a
- * throwing or blocking `tool_call` handler is a refusal of the tool call, so a
- * graph query that stalled could deny the operator's `grep`.
+ * Registers `session_start`, `tool_result`, and `session_shutdown`, and never
+ * `tool_call`: a throwing or blocking `tool_call` handler is a refusal of the
+ * tool call, so a graph query that stalled could deny the operator's `grep`.
  */
+/**
+ * How long after session start the graph session is opened.
+ *
+ * Zero, and still on the scheduler: the callback runs off the `session_start`
+ * handler so nothing here is on the blocking path, but it starts racing the
+ * model's first tool call immediately. It has ~2.9 s of handshake to get
+ * through against a warm CBM daemon and ~9 s when the daemon has to start, and
+ * a query will not wait for it -- so every millisecond of head start is a
+ * search that gets graph context instead of nothing.
+ *
+ * The cost is one CBM client at 2.6 MB resident, against a daemon that already
+ * holds the graph for this account.
+ */
+const WARM_DELAY_MS = 0;
+
 export default function ompCodebaseMemoryAugmentation(pi: ExtensionAPI): void {
   const host = processHost();
 
@@ -48,12 +64,16 @@ export default function ompCodebaseMemoryAugmentation(pi: ExtensionAPI): void {
     pi.logger.info("omp-codebase-memory: augmentation", { message });
   };
 
-  pi.on("tool_result", async (event, ctx) => {
-    current = ctx;
+  /**
+   * The augmenter, built once and shared by the warm-up and the handler.
+   *
+   * `cwd` comes from whichever context arrives first, and both events carry the
+   * same session's directory.
+   */
+  const ensure = (ctx: ExtensionContext): Augmenter => {
     augmenter ??= createAugmenter({
-      // Lazy, and at most once: a session that never searches never starts a
-      // CBM process, and an executable that has already failed to resolve is
-      // not asked again.
+      // At most once: an executable that has already failed to resolve is not
+      // asked again for the life of the session.
       openClient: async () => {
         const resolution = await resolveExecutable(host, await readState(host));
         if (!resolution.ok) {
@@ -74,7 +94,30 @@ export default function ompCodebaseMemoryAugmentation(pi: ExtensionAPI): void {
       },
       debug,
     });
-    return await augmenter.handle(event);
+    return augmenter;
+  };
+
+  /**
+   * Session start: open the graph session in the background and nowhere near
+   * the blocking path.
+   *
+   * Deferred onto a managed timer, for the reason `src/scheduler.ts` gives, and
+   * short enough to land before a first search: a session's first tool call
+   * follows its first model turn, which is slower than this. A search that
+   * arrives first still costs nothing -- it refuses to wait for the handshake
+   * and appends nothing.
+   */
+  pi.on("session_start", (_event, ctx) => {
+    current = ctx;
+    const augment = ensure(ctx);
+    schedulerFrom(ctx).after(() => {
+      void augment.warm();
+    }, WARM_DELAY_MS);
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    current = ctx;
+    return await ensure(ctx).handle(event);
   });
 
   // The graph session is the one resource this entry holds. Released here so a

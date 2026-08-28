@@ -76,6 +76,17 @@ export interface AugmentDeps {
 /** The `tool_result` handler, and the client it holds for the session. */
 export interface Augmenter {
   handle(event: ToolResultEvent): Promise<ToolResultEventResult | undefined>;
+  /**
+   * Opens the graph session and resolves the project ahead of the first search.
+   *
+   * Called from a deferred timer at session start, and never awaited by a tool
+   * result. Without it the first search in every session would append nothing:
+   * a query refuses to wait for the handshake, and the handshake is the one slow
+   * step -- ~2.9 s against a warm CBM daemon, ~9 s when the daemon has to start.
+   * Paying that in the background is what makes the first `grep` useful instead
+   * of merely fast.
+   */
+  warm(): Promise<void>;
   /** Releases the graph client. Safe before the first augmentation. */
   close(): void;
 }
@@ -155,6 +166,28 @@ export function createAugmenter(deps: AugmentDeps): Augmenter {
       }
     },
 
+    async warm() {
+      const started = Date.now();
+      try {
+        const active = await session();
+        if (active === null) return;
+        // `toolNames` is the one call that waits for the handshake, so it is
+        // what turns "started" into "ready"; the project resolution then runs
+        // on a session a search will find warm.
+        const ready = (await active.client.toolNames()) !== null;
+        const resolution = await active.resolver.resolve();
+        // Recorded because the warm-up is a race against the first search and
+        // its outcome is otherwise invisible: a session whose searches append
+        // nothing needs one line saying whether the session was ready and which
+        // project it resolved.
+        deps.debug(
+          `warm-up ${ready ? "ready" : "incomplete"} in ${Date.now() - started}ms, project ${resolution.kind}`,
+        );
+      } catch (error) {
+        deps.debug(`warm-up failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+
     close() {
       client?.close();
       client = null;
@@ -212,14 +245,18 @@ function queryFrom(pattern: unknown): { readonly query: string } | null {
 }
 
 /**
- * A file-path regex built from a glob, or `null` when there is no path to
- * filter on.
+ * A `file_pattern` built from a glob, or `null` when there is no path to filter
+ * on.
  *
- * Three constructs are translated and everything else is escaped, so a pattern
- * this function does not understand narrows the search rather than widening it.
- * `**` + separator becomes an optional run of directories rather than a
- * mandatory one, because `src/**` + `/*.ts` must still match `src/a.ts` -- the
- * mistake that makes a globstar quietly skip the top level.
+ * `file_pattern` is a LIKE match, not a regex. Measured against v0.10.8: `src`
+ * matches 276 nodes, `src/.*` matches none, and `src/*` matches 275 -- so `.` is
+ * a literal there while `*` behaves as `%`. The glob is therefore translated to
+ * LIKE wildcards and consecutive ones collapsed, which is also what makes a
+ * globstar behave: `src/**` + `/*.ts` becomes `src/%.ts` and matches both
+ * `src/resolve.ts` and `src/harvest/collect.ts`.
+ *
+ * A pattern that reduces to a bare `%` is refused: it selects the whole project,
+ * which is not an answer to any search.
  */
 function filePatternFrom(value: unknown): { readonly file_pattern: string } | null {
   if (typeof value !== "string") return null;
@@ -228,19 +265,14 @@ function filePatternFrom(value: unknown): { readonly file_pattern: string } | nu
   const glob = value.split(";")[0]?.trim() ?? "";
   if (glob === "" || glob === ".") return null;
 
-  const translated = glob
-    .split("**/")
-    .map((run) =>
-      run
-        .split("**")
-        .map((part) => part.replace(/[.+^${}()|[\]\\]/gu, "\\$&").replaceAll("*", "[^/]*").replaceAll("?", "."))
-        .join(".*"),
-    )
-    .join("(?:.*/)?");
-  return { file_pattern: translated };
+  const like = glob
+    .replaceAll("?", "_")
+    .replace(/\*+\/?/gu, "%")
+    .replace(/%+/gu, "%");
+  return like === "%" ? null : { file_pattern: like };
 }
 
-/** One graph row, flattened out of the grouped response `search_graph` returns. */
+/** One graph row, flattened out of whichever response shape produced it. */
 interface SymbolRow {
   readonly qualified: string;
   readonly label: string;
@@ -248,49 +280,95 @@ interface SymbolRow {
   readonly lines: string;
 }
 
+/** Where each field sits in a response's column-ordered rows. `-1` means absent. */
+interface Columns {
+  readonly qn: number;
+  readonly name: number;
+  readonly label: number;
+  readonly file: number;
+  readonly lines: number;
+}
+
 /**
- * The rows of a `search_graph` JSON response.
+ * The rows of a `search_graph` JSON response, in either shape it answers with.
  *
- * The response is grouped by qualified-name prefix with column-ordered row
- * arrays, so the columns are read by the names the response itself declares
- * rather than by position -- a reordered `cols` would otherwise silently swap
- * two fields.
+ * The two shapes are not interchangeable and both are needed. A keyword search
+ * -- what a `grep` pattern becomes -- answers flat: one `rows` list whose
+ * columns are `qn, label, file, lines, rank`, carrying whole qualified names. A
+ * pattern search -- what a `glob` becomes -- answers grouped: `groups` each
+ * carrying a `qn_prefix` and a `file`, with rows whose columns are
+ * `name, label, lines, in, out`. Reading only the grouped shape silently
+ * returned nothing for every `grep`, which is the bug this handles.
+ *
+ * Columns are read by the names the response itself declares rather than by
+ * position, so a reordered `cols` cannot silently swap two fields.
  */
 function readRows(structured: unknown): readonly SymbolRow[] | null {
-  if (typeof structured !== "object" || structured === null) return null;
-  if (!("cols" in structured) || !("groups" in structured)) return null;
-  const { cols, groups } = structured;
-  if (!Array.isArray(cols) || !Array.isArray(groups)) return null;
+  if (typeof structured !== "object" || structured === null || !("cols" in structured)) return null;
+  const declared = structured.cols;
+  if (!Array.isArray(declared)) return null;
 
-  const nameAt = cols.indexOf("name");
-  const labelAt = cols.indexOf("label");
-  const linesAt = cols.indexOf("lines");
-  if (nameAt === -1) return null;
+  const at = (key: string): number => declared.indexOf(key);
+  const columns: Columns = { qn: at("qn"), name: at("name"), label: at("label"), file: at("file"), lines: at("lines") };
+  if (columns.qn === -1 && columns.name === -1) return null;
 
   const rows: SymbolRow[] = [];
-  for (const group of groups as readonly unknown[]) {
-    if (typeof group !== "object" || group === null) continue;
-    if (!("qn_prefix" in group) || !("rows" in group)) continue;
-    const prefix = group.qn_prefix;
-    const file = "file" in group && typeof group.file === "string" ? group.file : "";
-    if (typeof prefix !== "string" || !Array.isArray(group.rows)) continue;
-
-    for (const row of group.rows as readonly unknown[]) {
-      if (!Array.isArray(row)) continue;
-      const name = row[nameAt];
-      if (typeof name !== "string" || name === "__file__") continue;
-      const label = labelAt === -1 ? "" : row[labelAt];
-      const lines = linesAt === -1 ? "" : row[linesAt];
-      rows.push({
-        qualified: `${prefix}.${name}`,
-        label: typeof label === "string" && label !== "" ? label : "symbol",
-        file,
-        lines: typeof lines === "string" && lines !== "" ? `:${lines}` : "",
-      });
-      if (rows.length >= SYMBOL_LIMIT) return rows;
-    }
+  if ("rows" in structured && Array.isArray(structured.rows)) {
+    collect(rows, structured.rows, columns, "", "");
+    return rows;
   }
-  return rows;
+  if ("groups" in structured && Array.isArray(structured.groups)) {
+    for (const group of structured.groups as readonly unknown[]) {
+      if (rows.length >= SYMBOL_LIMIT) break;
+      if (typeof group !== "object" || group === null || !("rows" in group)) continue;
+      if (!Array.isArray(group.rows)) continue;
+      const prefix = "qn_prefix" in group && typeof group.qn_prefix === "string" ? group.qn_prefix : "";
+      const file = "file" in group && typeof group.file === "string" ? group.file : "";
+      collect(rows, group.rows, columns, prefix, file);
+    }
+    return rows;
+  }
+  return null;
+}
+
+/**
+ * Appends one row list to `out`, bounded by {@link SYMBOL_LIMIT}.
+ *
+ * `prefix` and `groupFile` supply what a grouped response keeps on the group
+ * rather than on the row; a flat response passes neither and carries both in its
+ * own columns.
+ */
+function collect(
+  out: SymbolRow[],
+  rows: readonly unknown[],
+  columns: Columns,
+  prefix: string,
+  groupFile: string,
+): void {
+  for (const row of rows) {
+    if (out.length >= SYMBOL_LIMIT) return;
+    if (!Array.isArray(row)) continue;
+
+    const cell = (index: number): string => {
+      if (index < 0) return "";
+      const value: unknown = row[index];
+      return typeof value === "string" ? value : "";
+    };
+
+    const bare = cell(columns.name);
+    const qualified = columns.qn >= 0 ? cell(columns.qn) : prefix === "" ? bare : `${prefix}.${bare}`;
+    // The File node a directory listing produces is not a symbol; it carries no
+    // definition and naming it would spend a bounded slot on nothing.
+    if (qualified === "" || qualified.endsWith("__file__")) continue;
+
+    const lines = cell(columns.lines);
+    out.push({
+      qualified,
+      label: cell(columns.label) === "" ? "symbol" : cell(columns.label),
+      file: cell(columns.file) === "" ? groupFile : cell(columns.file),
+      lines: lines === "" ? "" : `:${lines}`,
+    });
+  }
 }
 
 /**

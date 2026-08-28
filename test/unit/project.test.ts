@@ -160,14 +160,43 @@ test("concurrent resolutions share one query rather than racing two", async () =
   expect(client.calls()).toBe(1);
 });
 
-test("an unreadable answer resolves to unavailable and is not retried", async () => {
-  const client = countingClient({ nothing: true });
-  const resolver = projectResolver(client, "/work/app");
+/**
+ * A graph that did not answer must not become the session's answer.
+ *
+ * The commonest cause is a search arriving while the session's handshake is
+ * still in flight -- ~2.9 s against a warm CBM daemon, ~8.6 s when the daemon
+ * has to start. Caching that disabled augmentation for the whole session over a
+ * few seconds of startup, which is the bug this covers.
+ */
+test("an unavailable graph is retried, and the first definitive answer settles it", async () => {
+  let calls = 0;
+  const client: GraphClient = {
+    call: async (tool) => {
+      if (tool !== "list_projects") return null;
+      calls += 1;
+      // Unready, unready, then ready -- the shape a handshake in flight has.
+      return calls < 3 ? null : { projects: [{ name: "app", root_path: "/work/app" }] };
+    },
+    toolNames: async () => null,
+    close: () => {},
+  };
+  const resolver = projectResolver(client, "/work/app/src");
 
   expect(await resolver.resolve()).toEqual({ kind: "unavailable" });
   expect(await resolver.resolve()).toEqual({ kind: "unavailable" });
-  // Once: the client tears its session down on a missed deadline, so retrying
-  // would pay the startup cost again against a session that stopped answering.
+  expect(await resolver.resolve()).toEqual({ kind: "project", project: project("app", "/work/app") });
+
+  // Settled now: the definitive answer is reused rather than re-queried.
+  expect(await resolver.resolve()).toEqual({ kind: "project", project: project("app", "/work/app") });
+  expect(calls).toBe(3);
+});
+
+test("an unindexed answer settles too, so a directory outside the graph is asked about once", async () => {
+  const client = countingClient({ projects: [{ name: "app", root_path: "/work/app" }] });
+  const resolver = projectResolver(client, "/tmp/elsewhere");
+
+  expect(await resolver.resolve()).toEqual({ kind: "unindexed" });
+  expect(await resolver.resolve()).toEqual({ kind: "unindexed" });
   expect(client.calls()).toBe(1);
 });
 

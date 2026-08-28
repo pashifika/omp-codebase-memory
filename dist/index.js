@@ -287,9 +287,16 @@ function openGraphClient(executable, options = {}) {
     })();
     return await handshake;
   };
+  const readyWithin = async (ms) => {
+    const started = ready();
+    const deadline = AbortSignal.timeout(ms);
+    const expired = Promise.withResolvers();
+    deadline.addEventListener("abort", () => expired.resolve(false), { once: true });
+    return await Promise.race([started, expired.promise]);
+  };
   return {
     async call(tool, args) {
-      if (!await ready())
+      if (!await readyWithin(queryTimeoutMs))
         return null;
       const result = await request("tools/call", { name: tool, arguments: args }, queryTimeoutMs);
       if (typeof result !== "object" || result === null)
@@ -457,17 +464,27 @@ function readProjects(structured) {
   return projects;
 }
 function projectResolver(client, cwd) {
-  let resolution = null;
+  let settled = null;
+  let inFlight = null;
   return {
     async resolve() {
-      resolution ??= (async () => {
-        const projects = readProjects(await client.call("list_projects", {}));
-        if (projects === null)
-          return { kind: "unavailable" };
-        const project = selectProject(projects, cwd);
-        return project === null ? { kind: "unindexed" } : { kind: "project", project };
+      if (settled !== null)
+        return settled;
+      inFlight ??= (async () => {
+        try {
+          const projects = readProjects(await client.call("list_projects", {}));
+          if (projects === null)
+            return { kind: "unavailable" };
+          const project = selectProject(projects, cwd);
+          return project === null ? { kind: "unindexed" } : { kind: "project", project };
+        } finally {
+          inFlight = null;
+        }
       })();
-      return await resolution;
+      const answer = await inFlight;
+      if (answer.kind !== "unavailable")
+        settled = answer;
+      return answer;
     }
   };
 }

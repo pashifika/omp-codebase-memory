@@ -278,9 +278,28 @@ export function openGraphClient(executable: string, options: GraphClientOptions 
     return await handshake;
   };
 
+  /**
+   * Whether the session is ready, waited on for at most `ms`.
+   *
+   * The handshake is the one slow thing here, and it must never be charged to a
+   * tool result. Measured: ~2.9 s against a warm daemon and ~9 s when the daemon
+   * has to start, which is what a first search would otherwise have waited for.
+   * So a caller with a deadline gets `false` when the handshake has not finished
+   * yet, the handshake keeps running in the background, and the next search
+   * finds it done. The first search in a session may therefore append nothing;
+   * that is the correct trade against holding up the operator's `grep`.
+   */
+  const readyWithin = async (ms: number): Promise<boolean> => {
+    const started = ready();
+    const deadline = AbortSignal.timeout(ms);
+    const expired = Promise.withResolvers<false>();
+    deadline.addEventListener("abort", () => expired.resolve(false), { once: true });
+    return await Promise.race([started, expired.promise]);
+  };
+
   return {
     async call(tool, args) {
-      if (!(await ready())) return null;
+      if (!(await readyWithin(queryTimeoutMs))) return null;
       const result = await request("tools/call", { name: tool, arguments: args }, queryTimeoutMs);
       if (typeof result !== "object" || result === null) return null;
       if ("isError" in result && result.isError === true) {

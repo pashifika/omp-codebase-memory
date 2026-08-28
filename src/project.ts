@@ -87,27 +87,43 @@ export interface ProjectResolver {
 /**
  * A resolver over one graph client and one working directory.
  *
- * A failed query is cached like any other answer. The client tears its session
- * down when a request misses its deadline, so a retry would spend the startup
- * cost again on a session that has already stopped answering.
+ * Only a *definitive* answer is cached. A graph that did not answer is not one:
+ * the commonest cause is a search arriving while the session's handshake is
+ * still in flight, and caching that would disable augmentation for the whole
+ * session over a few seconds of startup. Measured: the handshake takes ~2.9 s
+ * against a warm CBM daemon and ~8.6 s when the daemon has to start, and this
+ * was exactly the bug -- one early `grep` poisoned every later one.
+ *
+ * Retrying costs one bounded `list_projects` per tool result until it succeeds,
+ * which is the same bound every other query already has.
  */
 export function projectResolver(client: GraphClient, cwd: string): ProjectResolver {
-  let resolution: Promise<ProjectResolution> | null = null;
+  let settled: ProjectResolution | null = null;
+  let inFlight: Promise<ProjectResolution> | null = null;
 
   return {
     async resolve() {
-      resolution ??= (async (): Promise<ProjectResolution> => {
-        // No cache-root override, here or anywhere: CBM refuses a command
-        // configured against a root other than the active daemon's, and that
-        // root is the only one holding the index this session can see.
-        const projects = readProjects(await client.call("list_projects", {}));
-        if (projects === null) return { kind: "unavailable" };
-        // An empty list and no match are the same state -- no indexed project --
-        // and neither is an error.
-        const project = selectProject(projects, cwd);
-        return project === null ? { kind: "unindexed" } : { kind: "project", project };
+      if (settled !== null) return settled;
+      // Concurrent callers share one query rather than racing several.
+      inFlight ??= (async (): Promise<ProjectResolution> => {
+        try {
+          // No cache-root override, here or anywhere: CBM refuses a command
+          // configured against a root other than the active daemon's, and that
+          // root is the only one holding the index this session can see.
+          const projects = readProjects(await client.call("list_projects", {}));
+          if (projects === null) return { kind: "unavailable" };
+          // An empty list and no match are the same state -- no indexed project
+          // -- and neither is an error.
+          const project = selectProject(projects, cwd);
+          return project === null ? { kind: "unindexed" } : { kind: "project", project };
+        } finally {
+          inFlight = null;
+        }
       })();
-      return await resolution;
+
+      const answer = await inFlight;
+      if (answer.kind !== "unavailable") settled = answer;
+      return answer;
     },
   };
 }

@@ -159,8 +159,18 @@ Four properties hold whether or not it is on:
    how much it may append. A query that misses the deadline appends nothing.
 4. An errored tool result is left alone.
 
-It holds one CBM process for the session, opened on the first search and closed
-at shutdown. A session that never searches never starts one.
+It holds one CBM process for the session, opened in the background at session
+start and closed at shutdown, at about 2.6 MB resident.
+
+That opening is not instant, and it is why the first seconds of a session are
+different. A CBM process needs roughly 2.9 s to answer its first request when a
+CBM daemon is already warm, and about 8.5 s when it has to start the daemon
+itself. A search will not wait for that — the deadline above is the whole point —
+so a search issued before the session is ready appends nothing and is otherwise
+untouched. In practice you type a prompt first and the session is long ready; in
+a scripted `omp -p` run the first one or two searches often are not. Nothing is
+lost either way, and `~/.omp/logs` records one line per session saying when the
+session became ready and which project it resolved.
 
 ## The system-first policy, and why it is not negotiable
 

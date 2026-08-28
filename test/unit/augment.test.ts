@@ -76,7 +76,12 @@ function readResult(target: string): ToolResultEvent {
   };
 }
 
-/** A `search_graph` JSON answer holding one group of `count` symbols. */
+/**
+ * A grouped `search_graph` answer holding one group of `count` symbols.
+ *
+ * The shape a pattern search returns: the qualified-name prefix and the file
+ * live on the group, and each row carries only the bare name.
+ */
 function symbols(count: number): unknown {
   return {
     cols: ["name", "label", "lines", "in", "out"],
@@ -87,6 +92,28 @@ function symbols(count: number): unknown {
         rows: Array.from({ length: count }, (_, index) => [`symbol${index}`, "Function", "1-2", 0, 0]),
       },
     ],
+  };
+}
+
+/**
+ * A flat `search_graph` answer holding `count` symbols.
+ *
+ * The shape a keyword search returns, which is what a `grep` pattern becomes.
+ * Reading only the grouped shape made every `grep` append nothing while every
+ * test passed, so both shapes are fixtured here.
+ */
+function flatSymbols(count: number): unknown {
+  return {
+    total: count,
+    search_mode: "bm25",
+    cols: ["qn", "label", "file", "lines", "rank"],
+    rows: Array.from({ length: count }, (_, index) => [
+      `app.src.a.symbol${index}`,
+      "Function",
+      "src/a.ts",
+      "1-2",
+      -19.04,
+    ]),
   };
 }
 
@@ -133,6 +160,7 @@ function recordingClient(answers: Readonly<Record<string, unknown>>): Recorder {
 
 interface Harness {
   handle: (event: ToolResultEvent) => Promise<ToolResultEventResult | undefined>;
+  warm: () => Promise<void>;
   readonly notices: string[];
   readonly debugLines: string[];
   readonly calls: { tool: string; args: Readonly<Record<string, unknown>> }[];
@@ -157,6 +185,7 @@ function harness(answers: Readonly<Record<string, unknown>>, client?: GraphClien
     notices,
     debugLines,
     calls: recorder.calls,
+    warm: async () => await augmenter.warm(),
     close: () => augmenter.close(),
   };
 }
@@ -164,9 +193,28 @@ function harness(answers: Readonly<Record<string, unknown>>, client?: GraphClien
 /** The `list_projects` answer that resolves `CWD` to {@link PROJECT}. */
 const LISTED = { projects: [{ name: PROJECT.name, root_path: PROJECT.root }] };
 
+interface GlobCase {
+  readonly scenario: string;
+  readonly glob: string;
+  /** The `file_pattern` sent, or `null` when the glob is not worth a query. */
+  readonly expected: string | null;
+}
+
+const globCases: GlobCase[] = [
+  { scenario: "a globstar collapses to one wildcard, so the top level still matches", glob: "src/**/*.ts", expected: "src/%.ts" },
+  { scenario: "a single star becomes a wildcard", glob: "src/*.ts", expected: "src/%.ts" },
+  { scenario: "a leading globstar collapses too", glob: "**/*.test.ts", expected: "%.test.ts" },
+  { scenario: "a question mark becomes a single-character wildcard", glob: "src/a?.ts", expected: "src/a_.ts" },
+  { scenario: "a plain directory is left as the substring it is", glob: "src", expected: "src" },
+  { scenario: "only the first of a semicolon-delimited list is queried", glob: "src/*.ts; test/*.ts", expected: "src/%.ts" },
+  { scenario: "the working root is not a search", glob: ".", expected: null },
+  { scenario: "a pattern that selects everything is not a search", glob: "**", expected: null },
+  { scenario: "an empty path is not a search", glob: "", expected: null },
+];
+
 describe("what the augmentation adds", () => {
   test("appends matching graph symbols to a grep, leaving its output untouched", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: symbols(2) });
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(2) });
     const original = [text("src/a.ts:1: hit"), text("src/b.ts:9: hit")];
 
     const result = await under.handle(grepResult("resolveExecutable", original));
@@ -178,8 +226,18 @@ describe("what the augmentation adds", () => {
     under.close();
   });
 
+  test("appends matching graph symbols from a grouped answer too", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: symbols(2) });
+
+    const result = await under.handle(globResult("src/*.ts"));
+
+    expect(appendedText(result)).toContain("app.src.a.symbol0");
+    expect(appendedText(result)).toContain("src/a.ts");
+    under.close();
+  });
+
   test("searches the graph by identifier, so a regex pattern is usable as a query", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: symbols(1) });
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(1) });
     await under.handle(grepResult("^\\s*(resolveExecutable|readState)\\b"));
 
     const search = under.calls.find((call) => call.tool === "search_graph");
@@ -188,12 +246,19 @@ describe("what the augmentation adds", () => {
     under.close();
   });
 
-  test("searches a glob by file path, because a glob names files rather than symbols", async () => {
+  /**
+   * `file_pattern` is a LIKE match, not a regex.
+   *
+   * Measured against v0.10.8: `src` matches 276 nodes, `src/.*` matches none,
+   * and `src/*` matches 275. A regex translation therefore selected nothing for
+   * every `glob`, which is why the expected values below are LIKE wildcards.
+   */
+  test.each(globCases)("$scenario", async ({ glob, expected }) => {
     const under = harness({ list_projects: LISTED, search_graph: symbols(1) });
-    await under.handle(globResult("src/**/*.ts"));
+    await under.handle(globResult(glob));
 
     const search = under.calls.find((call) => call.tool === "search_graph");
-    expect(search?.args["file_pattern"]).toBe("src/(?:.*/)?[^/]*\\.ts");
+    expect(search?.args["file_pattern"] ?? null).toBe(expected);
     under.close();
   });
 
@@ -217,7 +282,7 @@ describe("what the augmentation adds", () => {
   });
 
   test("bounds the appended entries however many the graph returns", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: symbols(200) });
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(200) });
     const result = await under.handle(grepResult("symbol"));
 
     const lines = appendedText(result).split("\n");
@@ -226,7 +291,7 @@ describe("what the augmentation adds", () => {
   });
 
   test("preserves content a prior handler in the chain already added", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: symbols(1) });
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(1) });
     const withPrior = [text("src/a.ts:1: hit"), text("added by another extension")];
 
     const result = await under.handle(grepResult("resolveExecutable", withPrior));
@@ -237,12 +302,41 @@ describe("what the augmentation adds", () => {
   });
 
   test("resolves the project once and reuses it across calls", async () => {
-    const under = harness({ list_projects: LISTED, search_graph: symbols(1) });
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(1) });
     await under.handle(grepResult("alpha"));
     await under.handle(grepResult("beta"));
 
     expect(under.calls.filter((call) => call.tool === "list_projects")).toHaveLength(1);
     expect(under.calls.filter((call) => call.tool === "search_graph")).toHaveLength(2);
+    under.close();
+  });
+
+  /**
+   * The warm-up exists so the *first* search is useful.
+   *
+   * A query refuses to wait for the handshake -- ~2.9 s against a warm CBM
+   * daemon, ~9 s when the daemon has to start -- so without a background open
+   * the first `grep` in every session would append nothing. Warming resolves the
+   * project too, which is why no search afterwards asks for it again.
+   */
+  test("warming opens the session and resolves the project before any search", async () => {
+    const under = harness({ list_projects: LISTED, search_graph: flatSymbols(1) });
+
+    await under.warm();
+    expect(under.calls.map((call) => call.tool)).toEqual(["list_projects"]);
+
+    const result = await under.handle(grepResult("resolveExecutable"));
+    expect(appendedText(result)).toContain("app.src.a.symbol0");
+    expect(under.calls.filter((call) => call.tool === "list_projects")).toHaveLength(1);
+    under.close();
+  });
+
+  test("warming with no executable is silent and leaves later searches untouched", async () => {
+    const under = harness({}, null);
+
+    await under.warm();
+    expect(await under.handle(grepResult("resolveExecutable"))).toBeUndefined();
+    expect(under.notices).toEqual([]);
     under.close();
   });
 });
@@ -269,7 +363,7 @@ interface FailOpenCase {
 const failOpenCases: FailOpenCase[] = [
   {
     scenario: "an errored tool result is left alone and the graph is never asked",
-    answers: { list_projects: LISTED, search_graph: symbols(1) },
+    answers: { list_projects: LISTED, search_graph: flatSymbols(1) },
     event: { ...grepResult("resolveExecutable"), isError: true },
     unasked: ["list_projects", "search_graph"],
   },
@@ -296,14 +390,14 @@ const failOpenCases: FailOpenCase[] = [
   },
   {
     scenario: "a graph that will not answer list_projects adds nothing and shows no notice",
-    answers: { search_graph: symbols(1) },
+    answers: { search_graph: flatSymbols(1) },
     event: grepResult("resolveExecutable"),
     unasked: ["search_graph"],
     notices: 0,
   },
   {
     scenario: "an unreadable list_projects answer adds nothing",
-    answers: { list_projects: { total: 0 }, search_graph: symbols(1) },
+    answers: { list_projects: { total: 0 }, search_graph: flatSymbols(1) },
     event: grepResult("resolveExecutable"),
     unasked: ["search_graph"],
     notices: 0,
@@ -315,12 +409,12 @@ const failOpenCases: FailOpenCase[] = [
   },
   {
     scenario: "a search with no graph match adds nothing",
-    answers: { list_projects: LISTED, search_graph: symbols(0) },
+    answers: { list_projects: LISTED, search_graph: flatSymbols(0) },
     event: grepResult("resolveExecutable"),
   },
   {
     scenario: "a grep pattern holding no identifier is not searched for",
-    answers: { list_projects: LISTED, search_graph: symbols(1) },
+    answers: { list_projects: LISTED, search_graph: flatSymbols(1) },
     event: grepResult("^\\s+$"),
     unasked: ["search_graph"],
   },

@@ -39,17 +39,27 @@ function readProjects(structured) {
   return projects;
 }
 function projectResolver(client, cwd) {
-  let resolution = null;
+  let settled = null;
+  let inFlight = null;
   return {
     async resolve() {
-      resolution ??= (async () => {
-        const projects = readProjects(await client.call("list_projects", {}));
-        if (projects === null)
-          return { kind: "unavailable" };
-        const project = selectProject(projects, cwd);
-        return project === null ? { kind: "unindexed" } : { kind: "project", project };
+      if (settled !== null)
+        return settled;
+      inFlight ??= (async () => {
+        try {
+          const projects = readProjects(await client.call("list_projects", {}));
+          if (projects === null)
+            return { kind: "unavailable" };
+          const project = selectProject(projects, cwd);
+          return project === null ? { kind: "unindexed" } : { kind: "project", project };
+        } finally {
+          inFlight = null;
+        }
       })();
-      return await resolution;
+      const answer = await inFlight;
+      if (answer.kind !== "unavailable")
+        settled = answer;
+      return answer;
     }
   };
 }
@@ -110,6 +120,19 @@ function createAugmenter(deps) {
         return;
       }
     },
+    async warm() {
+      const started = Date.now();
+      try {
+        const active = await session();
+        if (active === null)
+          return;
+        const ready = await active.client.toolNames() !== null;
+        const resolution = await active.resolver.resolve();
+        deps.debug(`warm-up ${ready ? "ready" : "incomplete"} in ${Date.now() - started}ms, project ${resolution.kind}`);
+      } catch (error) {
+        deps.debug(`warm-up failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
     close() {
       client?.close();
       client = null;
@@ -149,51 +172,64 @@ function filePatternFrom(value) {
   const glob = value.split(";")[0]?.trim() ?? "";
   if (glob === "" || glob === ".")
     return null;
-  const translated = glob.split("**/").map((run) => run.split("**").map((part) => part.replace(/[.+^${}()|[\]\\]/gu, "\\$&").replaceAll("*", "[^/]*").replaceAll("?", ".")).join(".*")).join("(?:.*/)?");
-  return { file_pattern: translated };
+  const like = glob.replaceAll("?", "_").replace(/\*+\/?/gu, "%").replace(/%+/gu, "%");
+  return like === "%" ? null : { file_pattern: like };
 }
 function readRows(structured) {
-  if (typeof structured !== "object" || structured === null)
+  if (typeof structured !== "object" || structured === null || !("cols" in structured))
     return null;
-  if (!("cols" in structured) || !("groups" in structured))
+  const declared = structured.cols;
+  if (!Array.isArray(declared))
     return null;
-  const { cols, groups } = structured;
-  if (!Array.isArray(cols) || !Array.isArray(groups))
-    return null;
-  const nameAt = cols.indexOf("name");
-  const labelAt = cols.indexOf("label");
-  const linesAt = cols.indexOf("lines");
-  if (nameAt === -1)
+  const at = (key) => declared.indexOf(key);
+  const columns = { qn: at("qn"), name: at("name"), label: at("label"), file: at("file"), lines: at("lines") };
+  if (columns.qn === -1 && columns.name === -1)
     return null;
   const rows = [];
-  for (const group of groups) {
-    if (typeof group !== "object" || group === null)
-      continue;
-    if (!("qn_prefix" in group) || !("rows" in group))
-      continue;
-    const prefix = group.qn_prefix;
-    const file = "file" in group && typeof group.file === "string" ? group.file : "";
-    if (typeof prefix !== "string" || !Array.isArray(group.rows))
-      continue;
-    for (const row of group.rows) {
-      if (!Array.isArray(row))
-        continue;
-      const name = row[nameAt];
-      if (typeof name !== "string" || name === "__file__")
-        continue;
-      const label = labelAt === -1 ? "" : row[labelAt];
-      const lines = linesAt === -1 ? "" : row[linesAt];
-      rows.push({
-        qualified: `${prefix}.${name}`,
-        label: typeof label === "string" && label !== "" ? label : "symbol",
-        file,
-        lines: typeof lines === "string" && lines !== "" ? `:${lines}` : ""
-      });
-      if (rows.length >= SYMBOL_LIMIT)
-        return rows;
-    }
+  if ("rows" in structured && Array.isArray(structured.rows)) {
+    collect(rows, structured.rows, columns, "", "");
+    return rows;
   }
-  return rows;
+  if ("groups" in structured && Array.isArray(structured.groups)) {
+    for (const group of structured.groups) {
+      if (rows.length >= SYMBOL_LIMIT)
+        break;
+      if (typeof group !== "object" || group === null || !("rows" in group))
+        continue;
+      if (!Array.isArray(group.rows))
+        continue;
+      const prefix = "qn_prefix" in group && typeof group.qn_prefix === "string" ? group.qn_prefix : "";
+      const file = "file" in group && typeof group.file === "string" ? group.file : "";
+      collect(rows, group.rows, columns, prefix, file);
+    }
+    return rows;
+  }
+  return null;
+}
+function collect(out, rows, columns, prefix, groupFile) {
+  for (const row of rows) {
+    if (out.length >= SYMBOL_LIMIT)
+      return;
+    if (!Array.isArray(row))
+      continue;
+    const cell = (index) => {
+      if (index < 0)
+        return "";
+      const value = row[index];
+      return typeof value === "string" ? value : "";
+    };
+    const bare = cell(columns.name);
+    const qualified = columns.qn >= 0 ? cell(columns.qn) : prefix === "" ? bare : `${prefix}.${bare}`;
+    if (qualified === "" || qualified.endsWith("__file__"))
+      continue;
+    const lines = cell(columns.lines);
+    out.push({
+      qualified,
+      label: cell(columns.label) === "" ? "symbol" : cell(columns.label),
+      file: cell(columns.file) === "" ? groupFile : cell(columns.file),
+      lines: lines === "" ? "" : `:${lines}`
+    });
+  }
 }
 async function coverageFor(client, project, root, input, cwd) {
   const target = input["path"];
@@ -395,9 +431,16 @@ function openGraphClient(executable, options = {}) {
     })();
     return await handshake;
   };
+  const readyWithin = async (ms) => {
+    const started = ready();
+    const deadline = AbortSignal.timeout(ms);
+    const expired = Promise.withResolvers();
+    deadline.addEventListener("abort", () => expired.resolve(false), { once: true });
+    return await Promise.race([started, expired.promise]);
+  };
   return {
     async call(tool, args) {
-      if (!await ready())
+      if (!await readyWithin(queryTimeoutMs))
         return null;
       const result = await request("tools/call", { name: tool, arguments: args }, queryTimeoutMs);
       if (typeof result !== "object" || result === null)
@@ -547,7 +590,20 @@ function pathOption(host) {
   return { PATH: host.env["PATH"] ?? "" };
 }
 
+// src/scheduler.ts
+function schedulerFrom(ctx) {
+  return {
+    after(callback, ms) {
+      return ctx.setTimeout(callback, ms);
+    },
+    cancel(handle) {
+      ctx.clearTimer(handle);
+    }
+  };
+}
+
 // src/augment-entry.ts
+var WARM_DELAY_MS = 0;
 function ompCodebaseMemoryAugmentation(pi) {
   const host = processHost();
   const native = nativeExtensionPath(host);
@@ -560,8 +616,7 @@ function ompCodebaseMemoryAugmentation(pi) {
   const debug = (message) => {
     pi.logger.info("omp-codebase-memory: augmentation", { message });
   };
-  pi.on("tool_result", async (event, ctx) => {
-    current = ctx;
+  const ensure = (ctx) => {
     augmenter ??= createAugmenter({
       openClient: async () => {
         const resolution = await resolveExecutable(host, await readState(host));
@@ -581,7 +636,18 @@ function ompCodebaseMemoryAugmentation(pi) {
       },
       debug
     });
-    return await augmenter.handle(event);
+    return augmenter;
+  };
+  pi.on("session_start", (_event, ctx) => {
+    current = ctx;
+    const augment = ensure(ctx);
+    schedulerFrom(ctx).after(() => {
+      augment.warm();
+    }, WARM_DELAY_MS);
+  });
+  pi.on("tool_result", async (event, ctx) => {
+    current = ctx;
+    return await ensure(ctx).handle(event);
   });
   pi.on("session_shutdown", () => {
     augmenter?.close();

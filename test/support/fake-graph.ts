@@ -10,6 +10,11 @@ import path from "node:path";
  * answer, a torn-down pipe, an unparseable line, a flood -- are all things a
  * server does, so they are configured here rather than mocked at the module
  * boundary where the client's own framing would go untested.
+ *
+ * The delays are real, and deliberately so: the subject under test is a deadline
+ * enforced against a separate process, and no clock this side controls reaches
+ * that process. A test that needs to observe a deadline being met polls for the
+ * condition rather than sleeping for a guessed duration.
  */
 export interface FakeGraphOptions {
   /** `structuredContent` per tool name. A tool not listed answers `isError`. */
@@ -20,6 +25,8 @@ export interface FakeGraphOptions {
   readonly delayMs?: number;
   /** Exit without answering `initialize`. */
   readonly refuseHandshake?: boolean;
+  /** How long `initialize` waits before answering, to outlast a caller's deadline. */
+  readonly handshakeDelayMs?: number;
   /** Answer `tools/call` with a line that is not JSON. */
   readonly garbage?: boolean;
   /** Answer `tools/call` with one line longer than the client's cap. */
@@ -66,6 +73,7 @@ process.stdin.on("data", async (chunk) => {
 
     if (request.method === "initialize") {
       if (options.refuseHandshake === true) process.exit(1);
+      if (options.handshakeDelayMs !== undefined) await Bun.sleep(options.handshakeDelayMs);
       send({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: "2024-11-05" } });
       continue;
     }
