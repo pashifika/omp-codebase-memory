@@ -1,13 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readdir } from "node:fs/promises";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmod, readdir, rm, stat } from "node:fs/promises";
+import path from "node:path";
 
-import { acquire, normalizeVersion } from "../../src/acquire.ts";
+import { acquire, normalizeVersion, repairMacOsSignature } from "../../src/acquire.ts";
 import { describeTarget } from "../../src/platform.ts";
-import { managedBinRoot, packageRoot } from "../../src/paths.ts";
+import { managedBinRoot, managedExecutable, packageRoot } from "../../src/paths.ts";
 import {
   buildArchive,
+  dropBuiltArchives,
   fakeSource,
   releaseMembers,
+  type BuiltArchive,
   type Member,
 } from "../support/release.ts";
 import { dropScratch, makeScratch, type Scratch } from "../support/scratch.ts";
@@ -19,6 +22,7 @@ import { dropScratch, makeScratch, type Scratch } from "../support/scratch.ts";
  */
 const TARGET = describeTarget(process.platform === "darwin" ? "darwin" : "linux", "arm64");
 const VERSION = "0.10.8";
+const NEWER = "0.11.0";
 const TAG = `v${VERSION}`;
 
 let scratch: Scratch;
@@ -30,6 +34,10 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await dropScratch(scratch);
+});
+
+afterAll(() => {
+  dropBuiltArchives();
 });
 
 /** Whether anything at all exists under the root this package owns. */
@@ -46,12 +54,13 @@ interface AbortCase {
   /** The archive members, which is what each failure is really about. */
   readonly members: (target: typeof TARGET) => Member[];
   /**
-   * The digest `checksums.txt` publishes.
+   * The digest `checksums.txt` publishes, resolved from the built archive.
    *
-   * `"real"` publishes the archive's own digest; a literal is how the mismatch
-   * path is reached without also corrupting the archive.
+   * A column rather than a sentinel the body decodes: every case but the
+   * mismatch publishes the archive's own digest, and a literal is how the
+   * mismatch path is reached without also corrupting the archive.
    */
-  readonly publishedDigest: "real" | string;
+  readonly publishedDigest: (archive: BuiltArchive) => string;
   /** The text the refusal must name. */
   readonly reported: RegExp;
 }
@@ -60,7 +69,7 @@ const aborts: AbortCase[] = [
   {
     scenario: "a digest mismatch aborts and names both digests",
     members: (target) => releaseMembers(target, VERSION),
-    publishedDigest: "0".repeat(64),
+    publishedDigest: () => "0".repeat(64),
     reported: /SHA-256 mismatch for .*: published 0{64}, downloaded [0-9a-f]{64}/u,
   },
   {
@@ -69,19 +78,19 @@ const aborts: AbortCase[] = [
       ...releaseMembers(target, VERSION),
       { name: "postinstall.sh", contents: "#!/bin/sh\nexit 0\n", mode: 0o755 },
     ],
-    publishedDigest: "real",
-    reported: /unexpected member: postinstall\.sh/u,
+    publishedDigest: (archive) => archive.digest,
+    reported: /unexpected member: "postinstall\.sh"/u,
   },
   {
     scenario: "a duplicated archive member aborts rather than last-one-wins",
     members: (target) => [...releaseMembers(target, VERSION), { name: "LICENSE", contents: "MIT\n" }],
-    publishedDigest: "real",
+    publishedDigest: (archive) => archive.digest,
     reported: /contains member LICENSE 2 times/u,
   },
   {
     scenario: "a missing archive member aborts",
     members: (target) => releaseMembers(target, VERSION).filter((m) => m.name !== "LICENSE"),
-    publishedDigest: "real",
+    publishedDigest: (archive) => archive.digest,
     reported: /missing member: LICENSE/u,
   },
   {
@@ -90,7 +99,7 @@ const aborts: AbortCase[] = [
       ...releaseMembers(target, VERSION).filter((m) => m.name !== target.executable),
       { name: target.executable, symlinkTo: "/bin/sh" },
     ],
-    publishedDigest: "real",
+    publishedDigest: (archive) => archive.digest,
     reported: /not a regular file: codebase-memory-mcp/u,
   },
   {
@@ -99,8 +108,19 @@ const aborts: AbortCase[] = [
       ...releaseMembers(target, VERSION).filter((m) => m.name !== target.executable),
       { name: target.executable, contents: "#!/bin/sh\nexit 3\n", mode: 0o755 },
     ],
-    publishedDigest: "real",
+    publishedDigest: (archive) => archive.digest,
     reported: /failed to run `--version`/u,
+  },
+  {
+    // `./`, `/`, and a whitespace-only name are all real tar spellings, and all
+    // three collapsed to the empty string under the previous normalization and
+    // were skipped -- which let an archive holding a fifth member satisfy a
+    // four-member closed set. This is the one of the three a real file on disk
+    // can be made to produce.
+    scenario: "a member whose name is only whitespace is refused rather than skipped",
+    members: (target) => [...releaseMembers(target, VERSION), { name: " ", contents: "ws\n" }],
+    publishedDigest: (archive) => archive.digest,
+    reported: /unexpected member: " "/u,
   },
 ];
 
@@ -116,7 +136,7 @@ describe("a failed acquisition writes nothing under the package-owned root", () 
       tag: TAG,
       archiveName: TARGET.archive,
       bytes: archive.bytes,
-      publishedDigest: publishedDigest === "real" ? archive.digest : publishedDigest,
+      publishedDigest: publishedDigest(archive),
     });
 
     const attempt = acquire({ host: scratch.host, target: TARGET, source });
@@ -157,6 +177,135 @@ describe("a verified acquisition", () => {
     });
 
     expect((await acquire({ host: scratch.host, target: TARGET, source })).version).toBe(VERSION);
+  });
+
+  test("the ./ spelling every tar writes for a member is accepted", async () => {
+    const members = releaseMembers(TARGET, VERSION).map((member) => ({
+      ...member,
+      name: `./${member.name}`,
+    }));
+    const archive = await buildArchive(TARGET.archive, members);
+    const source = fakeSource({
+      tag: TAG,
+      archiveName: TARGET.archive,
+      bytes: archive.bytes,
+      publishedDigest: archive.digest,
+    });
+
+    const acquired = await acquire({ host: scratch.host, target: TARGET, source });
+
+    expect(acquired.version).toBe(VERSION);
+    expect(await Bun.file(acquired.executable).exists()).toBe(true);
+  });
+
+  test("adopting a newer version leaves the previous version's executable in place", async () => {
+    const first = await buildArchive(TARGET.archive, releaseMembers(TARGET, VERSION));
+    await acquire({
+      host: scratch.host,
+      target: TARGET,
+      source: fakeSource({
+        tag: TAG,
+        archiveName: TARGET.archive,
+        bytes: first.bytes,
+        publishedDigest: first.digest,
+      }),
+    });
+
+    const second = await buildArchive(TARGET.archive, releaseMembers(TARGET, NEWER));
+    const acquired = await acquire({
+      host: scratch.host,
+      target: TARGET,
+      source: fakeSource({
+        tag: `v${NEWER}`,
+        archiveName: TARGET.archive,
+        bytes: second.bytes,
+        publishedDigest: second.digest,
+      }),
+    });
+
+    expect(acquired.version).toBe(NEWER);
+    expect(await Bun.file(managedExecutable(scratch.host, NEWER)).exists()).toBe(true);
+    // The previous version is what resolution falls back to if the pointer
+    // update does not land, so adopting over it is a worse failure than not
+    // adopting at all.
+    expect(await Bun.file(managedExecutable(scratch.host, VERSION)).exists()).toBe(true);
+  });
+
+  test("re-adopting a version replaces its executable instead of rewriting it in place", async () => {
+    const archive = await buildArchive(TARGET.archive, releaseMembers(TARGET, VERSION));
+    const source = fakeSource({
+      tag: TAG,
+      archiveName: TARGET.archive,
+      bytes: archive.bytes,
+      publishedDigest: archive.digest,
+    });
+
+    const first = await acquire({ host: scratch.host, target: TARGET, source });
+    const before = await stat(first.executable);
+    const second = await acquire({ host: scratch.host, target: TARGET, source });
+    const after = await stat(second.executable);
+
+    // A different inode is the observable difference between "staged, then
+    // committed by one rename" and "written straight onto the live path". Only
+    // the first leaves the previously resolved executable whole when the write
+    // or the chmod behind it fails.
+    expect(after.ino).not.toBe(before.ino);
+    expect(after.mode & 0o777).toBe(0o755);
+  });
+
+  test("a scratch directory that cannot be removed does not fail a committed adoption", async () => {
+    // The smoke check runs the candidate, which is the only place a test can
+    // reach acquisition's own temporary directory. The candidate reports its
+    // directory and then makes it unremovable, so the `finally` cleanup fails
+    // after the executable has already been adopted.
+    const marker = path.join(scratch.root, "candidate-dir");
+    const members: Member[] = [
+      {
+        name: TARGET.executable,
+        mode: 0o755,
+        contents:
+          `#!/bin/sh\necho "codebase-memory-mcp ${VERSION}"\n` +
+          `dir=$(dirname "$0")\nprintf '%s' "$dir" > "${marker}"\nchmod 0500 "$dir"\n`,
+      },
+      ...releaseMembers(TARGET, VERSION).filter((member) => member.name !== TARGET.executable),
+    ];
+    const archive = await buildArchive(TARGET.archive, members);
+    const source = fakeSource({
+      tag: TAG,
+      archiveName: TARGET.archive,
+      bytes: archive.bytes,
+      publishedDigest: archive.digest,
+    });
+
+    try {
+      const acquired = await acquire({ host: scratch.host, target: TARGET, source });
+      expect(await Bun.file(acquired.executable).exists()).toBe(true);
+    } finally {
+      if (await Bun.file(marker).exists()) {
+        const locked = await Bun.file(marker).text();
+        await chmod(locked, 0o700);
+        await rm(locked, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+/**
+ * `xattr` and `codesign` exist only on macOS, and `run` resolves them from the
+ * process's own `PATH` rather than the scratch one, so this pair cannot be
+ * substituted. A path that does not exist is what makes both tools fail for a
+ * reason the test controls.
+ */
+describe.skipIf(process.platform !== "darwin")("the macOS repair step", () => {
+  test("a failed quarantine removal is refused rather than read as a missing attribute", async () => {
+    const missing = path.join(scratch.root, "not-extracted", "codebase-memory-mcp");
+
+    // Named `xattr`, not `codesign`: before the fix the discarded `xattr`
+    // result let the failure surface two steps later as a signing failure,
+    // which reports the wrong cause and only by accident reports at all.
+    await expect(repairMacOsSignature(scratch.host, missing)).rejects.toThrow(
+      /could not clear the candidate's extended attributes/u,
+    );
   });
 });
 

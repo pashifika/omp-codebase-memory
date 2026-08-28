@@ -1,3 +1,4 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -49,9 +50,45 @@ export function releaseMembers(target: Target, version: string): Member[] {
   ];
 }
 
+/**
+ * One staging root for every archive this process builds.
+ *
+ * A `mkdtemp` per archive had no matching removal, so every case that built one
+ * left a `.tar.gz` and an extracted tree in `$TMPDIR` -- 25 per unit run, and
+ * unbounded over a machine's life. One root means the cleanup is one removal
+ * rather than one per case, and it means a test file that forgets
+ * {@link dropBuiltArchives} leaks a single directory instead of a directory per
+ * archive. `process.on("exit")` would have needed no caller cooperation at all,
+ * but `bun test` never fires it.
+ */
+let stagingRoot: string | undefined;
+
+function stagingRootOnce(): string {
+  if (stagingRoot === undefined) {
+    // Created synchronously so two concurrent builds cannot each allocate a
+    // root and leave one of them without an owner.
+    stagingRoot = mkdtempSync(path.join(tmpdir(), "cbm-archive-"));
+  }
+  return stagingRoot;
+}
+
+/**
+ * Removes everything {@link buildArchive} staged, for an `afterAll`.
+ *
+ * Re-arming rather than one-shot: `bun test` evaluates this module once for the
+ * whole run, so each test file's `afterAll` sees a root the previous file's
+ * `afterAll` already removed, and the next `buildArchive` has to be able to
+ * allocate a fresh one.
+ */
+export function dropBuiltArchives(): void {
+  if (stagingRoot === undefined) return;
+  rmSync(stagingRoot, { recursive: true, force: true });
+  stagingRoot = undefined;
+}
+
 /** Builds a `.tar.gz` holding exactly `members`. */
 export async function buildArchive(name: string, members: readonly Member[]): Promise<BuiltArchive> {
-  const staging = await mkdtemp(path.join(tmpdir(), "cbm-archive-"));
+  const staging = await mkdtemp(path.join(stagingRootOnce(), "archive-"));
   const content = path.join(staging, "content");
   await mkdir(content, { recursive: true });
 

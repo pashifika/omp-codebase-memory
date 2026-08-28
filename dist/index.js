@@ -255,7 +255,7 @@ function schedulerFrom(ctx) {
 import { rm as rm2 } from "fs/promises";
 
 // src/acquire.ts
-import { chmod, lstat, mkdtemp, mkdir, rm } from "fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, rename, rm } from "fs/promises";
 import { tmpdir } from "os";
 import path2 from "path";
 
@@ -431,7 +431,7 @@ async function acquire(request) {
     const reportedVersion = await smokeCheck(candidate, target);
     return await adopt(host, { version, digest: expected, candidate, reportedVersion });
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true }).catch(() => {});
   }
 }
 async function assertArchiveMembers(archive, target) {
@@ -439,14 +439,15 @@ async function assertArchiveMembers(archive, target) {
   if (!listed.ok) {
     throw new Error(`could not enumerate ${path2.basename(archive)}: ${listed.stderr.trim() || listed.spawnError || `tar exited ${listed.exitCode}`}`);
   }
+  const records = listed.stdout.split(`
+`);
+  if (records[records.length - 1] === "")
+    records.pop();
   const seen = new Map;
-  for (const raw of listed.stdout.split(`
-`)) {
-    const member = raw.trim().replace(/^\.\//u, "").replace(/\/+$/u, "");
-    if (member === "")
-      continue;
+  for (const raw of records) {
+    const member = raw.startsWith("./") ? raw.slice(2) : raw;
     if (!target.members.includes(member)) {
-      throw new Error(`release archive contains unexpected member: ${member}`);
+      throw new Error(`release archive contains unexpected member: ${JSON.stringify(raw)}`);
     }
     seen.set(member, (seen.get(member) ?? 0) + 1);
   }
@@ -485,7 +486,10 @@ async function repairMacOsSignature(host, candidate) {
       throw new Error(`${tool} is required to prepare a macOS binary and is not on PATH; ` + `install the Xcode command line tools, or repair the candidate yourself with \`${repairHint(candidate)}\``);
     }
   }
-  await run(["xattr", "-d", "com.apple.quarantine", candidate], { timeoutMs: 1e4 });
+  const cleared = await run(["xattr", "-cr", candidate], { timeoutMs: 1e4 });
+  if (!cleared.ok) {
+    throw new Error(`could not clear the candidate's extended attributes: ${cleared.stderr.trim() || cleared.spawnError || `xattr exited ${cleared.exitCode}`}. ` + `Repair it by hand with \`${repairHint(candidate)}\``);
+  }
   const signed = await run(["codesign", "--sign", "-", "--force", candidate], {
     timeoutMs: 60000
   });
@@ -501,11 +505,21 @@ async function smokeCheck(candidate, target) {
   throw new Error(`the downloaded executable failed to run \`--version\`.${suffix}`);
 }
 async function adopt(host, candidate) {
-  const destination = path2.join(managedBinRoot(host), candidate.version);
-  await mkdir(destination, { recursive: true });
-  const executable = path2.join(destination, path2.basename(candidate.candidate));
-  await Bun.write(executable, Bun.file(candidate.candidate));
-  await chmod(executable, 493);
+  const binRoot = managedBinRoot(host);
+  const destination = path2.join(binRoot, candidate.version);
+  const name = path2.basename(candidate.candidate);
+  const executable = path2.join(destination, name);
+  await mkdir(binRoot, { recursive: true });
+  const staging = await mkdtemp(path2.join(binRoot, ".staging-"));
+  try {
+    const staged = path2.join(staging, name);
+    await Bun.write(staged, Bun.file(candidate.candidate));
+    await chmod(staged, 493);
+    await mkdir(destination, { recursive: true });
+    await rename(staged, executable);
+  } finally {
+    await rm(staging, { recursive: true, force: true }).catch(() => {});
+  }
   return {
     version: candidate.version,
     digest: candidate.digest,

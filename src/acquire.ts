@@ -1,5 +1,5 @@
 import type { Stats } from "node:fs";
-import { chmod, lstat, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -121,7 +121,11 @@ export async function acquire(request: AcquireRequest): Promise<Acquired> {
     const reportedVersion = await smokeCheck(candidate, target);
     return await adopt(host, { version, digest: expected, candidate, reportedVersion });
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    // Swallowed rather than awaited into the result: by the time this runs the
+    // adoption has either committed or thrown, and letting a cleanup rejection
+    // replace a completed adoption's return value would report a working
+    // managed copy as a failed acquisition.
+    await rm(scratch, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -142,12 +146,26 @@ export async function assertArchiveMembers(archive: string, target: Target): Pro
     );
   }
 
+  // `split("\n")` yields one empty trailing record for the final newline, and
+  // that record is the delimiter rather than a member. Every other record is
+  // accounted for or refused: the previous normalization ran `trim()` and
+  // stripped trailing slashes first, which collapsed the real tar spellings
+  // `./`, `/`, and a whitespace-only name to the empty string and skipped
+  // them -- and a record skipped here is a hole in a closed set, because it
+  // reaches extraction without ever having been compared to the allowlist.
+  const records = listed.stdout.split("\n");
+  if (records[records.length - 1] === "") records.pop();
+
   const seen = new Map<string, number>();
-  for (const raw of listed.stdout.split("\n")) {
-    const member = raw.trim().replace(/^\.\//u, "").replace(/\/+$/u, "");
-    if (member === "") continue;
+  for (const raw of records) {
+    // The `./name` spelling is the same member as `name`; nothing else is
+    // normalized, so a trailing slash, surrounding whitespace, or a bare `.`
+    // stays a name the allowlist does not hold.
+    const member = raw.startsWith("./") ? raw.slice(2) : raw;
     if (!target.members.includes(member)) {
-      throw new Error(`release archive contains unexpected member: ${member}`);
+      // Quoted, because the records this refusal exists to catch are `/`, `./`
+      // and a whitespace-only name, and unquoted those name nothing at all.
+      throw new Error(`release archive contains unexpected member: ${JSON.stringify(raw)}`);
     }
     seen.set(member, (seen.get(member) ?? 0) + 1);
   }
@@ -206,11 +224,14 @@ function repairHint(candidate: string): string {
  * downloaded from the network is refused by Gatekeeper, and the resulting
  * failure is a kill signal with no message that explains it. Upstream's
  * installer does both and ignores their failures; this one reports a *missing
- * tool* by name, because that is a diagnosable host problem, while tolerating a
- * missing attribute, which is the normal case for an archive fetched over
- * HTTPS rather than by a browser.
+ * tool* by name, because that is a diagnosable host problem.
+ *
+ * Exported so a test can reach the two refusals: `run` resolves `xattr` and
+ * `codesign` from the process's own `PATH` rather than {@link Host}'s, so
+ * neither can be substituted, and the argument is the only thing a test
+ * controls.
  */
-async function repairMacOsSignature(host: Host, candidate: string): Promise<void> {
+export async function repairMacOsSignature(host: Host, candidate: string): Promise<void> {
   const pathEnv = host.env["PATH"];
   for (const tool of ["xattr", "codesign"] as const) {
     if (!haveTool(tool, pathEnv)) {
@@ -221,9 +242,21 @@ async function repairMacOsSignature(host: Host, candidate: string): Promise<void
     }
   }
 
-  // A missing attribute is the common case and prints "No such xattr" on stderr;
-  // that is not a failure, so only the tool's absence above is refused.
-  await run(["xattr", "-d", "com.apple.quarantine", candidate], { timeoutMs: 10_000 });
+  // `-cr` rather than `-d com.apple.quarantine`: clearing nothing is an exit-0
+  // success, so the normal case -- an archive fetched over HTTPS was never
+  // quarantined and has no attribute to remove -- no longer has to be told
+  // apart from a real failure by matching `xattr`'s stderr. That distinction
+  // was not being made at all: the result was discarded, so a non-zero exit, a
+  // timeout, and an unspawnable `xattr` were all read as "the attribute was not
+  // there", and quarantine removal was reported as done without having run. It
+  // is also exactly what `repairHint` tells the operator to run.
+  const cleared = await run(["xattr", "-cr", candidate], { timeoutMs: 10_000 });
+  if (!cleared.ok) {
+    throw new Error(
+      `could not clear the candidate's extended attributes: ${cleared.stderr.trim() || cleared.spawnError || `xattr exited ${cleared.exitCode}`}. ` +
+        `Repair it by hand with \`${repairHint(candidate)}\``,
+    );
+  }
 
   const signed = await run(["codesign", "--sign", "-", "--force", candidate], {
     timeoutMs: 60_000,
@@ -260,20 +293,48 @@ async function smokeCheck(candidate: string, target: Target): Promise<string> {
  * Places the verified candidate under the package-owned root.
  *
  * The first write outside the temporary directory happens here, after every
- * check has passed. The previous version's directory is left in place: it is
- * what resolution falls back to if this adoption's pointer update does not
- * land, and removing it would make a failed update worse than a skipped one.
+ * check has passed. The copy is written and made executable inside a unique
+ * staging directory, and one `rename` onto the final path is the operation's
+ * only commit point. Writing straight to `bin/<version>/` cannot offer that:
+ * re-adopting the version currently resolved would rewrite the live executable,
+ * so a failed `chmod` behind that write would leave the previously resolved
+ * executable truncated or unrunnable -- and the requirement is that every
+ * failure leaves it in use.
+ *
+ * The staging directory sits under `bin/` rather than in `$TMPDIR` because
+ * `rename` is atomic only within one filesystem, and `$TMPDIR` is routinely on
+ * another one. `bin/<version>/` itself is created before the rename, but an
+ * empty directory is not a resolvable executable, so nothing can observe it as
+ * a half-finished adoption.
+ *
+ * The previous version's directory is left in place: it is what resolution
+ * falls back to if this adoption's pointer update does not land, and removing
+ * it would make a failed update worse than a skipped one.
  */
 async function adopt(
   host: Host,
   candidate: { version: string; digest: string; candidate: string; reportedVersion: string },
 ): Promise<Acquired> {
-  const destination = path.join(managedBinRoot(host), candidate.version);
-  await mkdir(destination, { recursive: true });
+  const binRoot = managedBinRoot(host);
+  const destination = path.join(binRoot, candidate.version);
+  const name = path.basename(candidate.candidate);
+  const executable = path.join(destination, name);
 
-  const executable = path.join(destination, path.basename(candidate.candidate));
-  await Bun.write(executable, Bun.file(candidate.candidate));
-  await chmod(executable, 0o755);
+  await mkdir(binRoot, { recursive: true });
+  const staging = await mkdtemp(path.join(binRoot, ".staging-"));
+  try {
+    const staged = path.join(staging, name);
+    await Bun.write(staged, Bun.file(candidate.candidate));
+    await chmod(staged, 0o755);
+    await mkdir(destination, { recursive: true });
+    await rename(staged, executable);
+  } finally {
+    // Before the rename this removes a candidate nothing has seen; after it,
+    // an empty directory. Either way a failure to remove it is not this
+    // operation's result -- swallowing it is what keeps a committed adoption
+    // from being reported as a failed one.
+    await rm(staging, { recursive: true, force: true }).catch(() => {});
+  }
 
   return {
     version: candidate.version,
