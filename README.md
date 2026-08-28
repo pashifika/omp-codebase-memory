@@ -50,8 +50,7 @@ in step, and described to the session that uses it.
 
 ## Install
 
-Install from the git spec. This is the supported primary route and delivers
-every shipped surface:
+Install from the git spec. This is the supported primary route:
 
 ```bash
 omp plugin install github:pashifika/omp-codebase-memory
@@ -77,19 +76,12 @@ omp plugin marketplace add pashifika/omp-codebase-memory
 omp plugin discover
 ```
 
-Two things differ on this route:
-
-1. **Installing needs a published release.** The catalog names the tag to
-   install, so `omp plugin install omp-codebase-memory@omp-codebase-memory`
-   fails with `Remote branch <tag> not found` until that release exists. No
-   release is published yet; use the git spec.
-2. **It does not deliver the rulebook rule.** Marketplace plugins are discovered
-   through a provider that contributes skills and agents but is not a rules
-   provider. A rulebook rule is one OMP reads on demand and lists by name rather
-   than injecting into every turn, so what it costs a session either way is one
-   listed name and description — and the skill carries the same guidance in
-   full. The skill, the three agents, the MCP entry, and the augmentation work on
-   both routes.
+One thing differs on this route. Installing resolves the tag the catalog names,
+so `omp plugin install omp-codebase-memory@omp-codebase-memory` fails with
+`Remote branch <tag> not found` until that release is published. None is
+published yet, so install from the git spec for now. Once a release exists,
+every shipped surface loads here exactly as it does on the git spec: the skill,
+the rulebook rule, the three agents, the MCP entry, and the augmentation.
 
 ### From a checkout
 
@@ -162,15 +154,16 @@ resolves it:
 | `PI_CODING_AGENT_DIR` | Used directly when set. Inside a session this is already OMP's own answer |
 | `OMP_PROFILE`, `PI_PROFILE` | Select `~/.omp/profiles/<name>/agent`. `OMP_PROFILE` wins; `PI_PROFILE` is read only when it is unset |
 | Neither | `~/.omp/agent` |
-| `PI_CONFIG_DIR` | Replaces the `.omp` directory name every path above hangs off |
+| `PI_CONFIG_DIR` | Replaces the `.omp` directory name in the two rows above. A directory named by `PI_CODING_AGENT_DIR` is used as given and is unaffected |
 
 A profile-scoped setup therefore gets the entry in the active profile only —
 writing every profile would configure profiles you never asked about — and
 `/cbm status` names the directory it resolved, so the scope is visible.
 
 CBM's own behaviour is CBM's configuration, not this package's. Three of its
-defaults decide what you see on a new machine, measured from
-`codebase-memory-mcp config list` at 0.10.8:
+defaults decide what you see on a new machine, as
+`codebase-memory-mcp config --help` prints them at 0.10.8 — that command reports
+the default beside each key, where `config list` reports your effective values:
 
 | Key | Default | What it means |
 |---|---|---|
@@ -187,11 +180,9 @@ CBM configuration key for you.
 Resolution order is **pin, `PATH`, `~/.local/bin`, managed copy** — system
 before managed, and the reason is the index rather than tidiness.
 
-CBM resolves one canonical cache root per account, and refuses to run when a
-process is configured against a different root while any CBM session or command
-is active. Two executables of different versions sharing that root produce
-mismatched index generations. Giving a managed copy a private cache root would
-trade the conflict for re-indexing every repository a second time — hours of
+CBM keeps one cache root per account, holding one graph, and two executables of
+different versions do not share it safely. Giving a managed copy a root of its
+own would trade that for re-indexing every repository a second time — hours of
 work on a large tree, and gigabytes to hold the same answers twice.
 
 So your existing installation wins. The cost is that this package cannot
@@ -217,8 +208,8 @@ Five committed files, all generated from the CBM executable by
 The agents declare `tools: read, grep, glob` and name no MCP tool, because an
 OMP subagent does not inherit one. Their prompts tell the child that the parent
 supplies the graph evidence and that the child must verify it against exact
-source. Every name carries the `codebase-memory-` prefix, so none of them can
-shadow one of OMP's own agents.
+source. Every name begins `codebase-memory`, so none of them can shadow one of
+OMP's own agents.
 
 ### The augmentation feature
 
@@ -239,10 +230,9 @@ Four guarantees hold whenever the feature is active:
 
 1. It only ever appends. Every chunk the tool produced reaches the model
    unchanged, including content another extension added first.
-2. It never runs on `tool_call`. OMP treats a handler that throws or blocks
-   there as a refusal of the tool call, so a slow query could deny your `grep`.
-   This one runs on `tool_result`, where a failure is caught and the run
-   continues.
+2. It never runs on `tool_call`, so it can never refuse or delay a call. It runs
+   on `tool_result` instead, and a failure of its own is caught there rather
+   than reaching your run.
 3. Every query has a deadline in the low hundreds of milliseconds and a bound on
    how much it may append. A query that misses the deadline appends nothing.
 4. An errored tool result is left alone.
@@ -284,8 +274,8 @@ again every time.
 - **CBM's configuration.** No account-wide CBM key is ever set for you.
 - **CBM's graph, index, watcher, and cache root.** All CBM's, shared with every
   other client on the account.
-- **Your tool calls.** The augmentation registers no `tool_call` handler, so it
-  can never refuse or delay a call — only add to a result.
+- **Your tool calls.** The augmentation registers no `tool_call` handler; it
+  only ever sees a result the tool already produced.
 
 ## Staying in step with CBM
 
@@ -296,7 +286,15 @@ records which, and lists every path the pipeline owns:
 {
   "cbmVersion": "0.10.8",
   "reportedVersion": "codebase-memory-mcp 0.10.8",
-  "sourceClients": ["claude", "augment"]
+  "sourceClients": ["claude", "augment"],
+  "generated": [
+    "agents/codebase-memory-auditor.md",
+    "agents/codebase-memory-scout.md",
+    "agents/codebase-memory.md",
+    "rules/codebase-memory.md",
+    "skills/codebase-memory/SKILL.md",
+    "harvest.json"
+  ]
 }
 ```
 
@@ -311,7 +309,7 @@ nothing that happens or fails to happen in this repository affects it.
 
 **The scheduled CI job, second.** It acquires the newest CBM release,
 regenerates every artifact, and fails when a committed copy differs. It runs on
-pushes, on pull requests, and weekly.
+pushes to the default branch, on pull requests, and weekly.
 
 The schedule has a blind spot that cannot be closed from inside the repository:
 GitHub disables scheduled workflows after prolonged repository inactivity, and
@@ -329,10 +327,9 @@ regenerates nothing on your machine.
   immediately and you are told the session needs `/mcp reload`.
 - **A foreign entry of the same name is left alone.** CBM's own installer,
   another tool, or a hand edit may already own the `codebase-memory-mcp` key.
-- **`mcp.json` has two possible writers.** OMP's `/mcp add` and this package
-  share no lock. The write is a read-modify-write against observed content and
-  fails closed on a shape it does not recognise, so a lost update degrades to a
-  missing entry that the next session start rewrites, never a corrupted file.
+- **`mcp.json` has two possible writers.** OMP's `/mcp add` and this package can
+  both write it. The worst outcome is a lost entry that the next session start
+  rewrites — never a corrupted file.
 - **Windows is unsupported.** It needs zip extraction, a different executable
   suffix, and its own path handling. It is one explicit
   unsupported-platform error rather than a half-implemented branch.

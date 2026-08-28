@@ -38,16 +38,22 @@ landed this way: `feat/graph-context-and-agents`,
 `docs/repository-guidelines`, `chore/commit-ruleset-payloads`.
 
 The default branch and release tags are protected by the rulesets committed
-under `.github/rulesets/`. Those files are the authority for every parameter;
-read them rather than trusting a value repeated in prose. Their shape:
+under `.github/rulesets/`. This section states two things and no more. First,
+the shape of that protection: the facts whose change would change how work lands
+here. Second, the two literals another file in this repository must match — the
+required check name `ci`, which is the gate job's own name in `ci.yml`, and the
+tag pattern `v*`, which a pushed tag and the catalog's `source.ref` must
+satisfy. Everything else those files configure is theirs to state: approval
+counts, the review and bypass booleans, the actor lists, and every other
+parameter. Read a value there rather than trusting one repeated in prose. The
+shape:
 
 - The default branch rejects deletion and non-fast-forward pushes.
 - Landing a change requires a pull request whose review threads are resolved.
 - The merge commit is the only permitted merge method.
 - Exactly one status check, named `ci`, is required, under a strict policy — so
   a branch must be current with the default branch before it can merge.
-- Release tags matching the ruleset's pattern reject deletion and
-  non-fast-forward pushes.
+- Release tags matching `v*` reject deletion and non-fast-forward pushes.
 
 Change protection by editing those files and reimporting them, never through the
 web interface. A rule changed in the browser is invisible to review and is
@@ -188,10 +194,14 @@ escapes handler dispatch entirely and surfaces as a process-level
 down the whole session. The context's timers run the callback with handler
 isolation, are `unref`'d, and are cleared on `session_shutdown`.
 
-**Never set an account-wide CBM configuration key for the operator.** That
-configuration is per-account and shared with every other CBM client on the
-machine, so a key written here changes behaviour for tools this package does not
-own and cannot restore.
+**Never set an account-wide CBM configuration key for the operator.** CBM 0.10.8
+exposes six keys through `codebase-memory-mcp config set` — `auto_index`,
+`auto_index_limit`, `auto_watch`, `ui-lang`, `ui_enabled`, `ui_port` — and every
+one is account-wide; none is scoped to a project or to a client. That store is
+shared with every CBM client on the machine, so a key written here silently
+changes what another editor's CBM session does. A read-before-write does not
+make it reversible: nothing records that this package wrote the key, and another
+client may set the same key meanwhile, so the value to put back is not knowable.
 
 **Never duplicate an action CBM's MCP tools already expose, indexing included.**
 The model already holds `index_repository`, and a second path through this

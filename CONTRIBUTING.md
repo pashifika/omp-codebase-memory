@@ -33,21 +33,23 @@ the tag installs the previous release under the new version's name.
    git push origin v0.1.0
    ```
 
-   A `v*` tag cannot be moved or deleted once pushed, so a tag at the wrong
-   commit is not recoverable — publish the next patch version instead.
+   A tag at the wrong commit is not recoverable under the tag ruleset — publish
+   the next patch version instead.
 
 3. **The version gate checks all four names.** `version-gate` in
-   `.github/workflows/release.yml` strips the tag's `v`, then compares it against
-   the manifest version, the catalog plugin version, and the catalog source ref.
+   `.github/workflows/release.yml` strips the tag's `v` and compares the result
+   against the manifest version and the catalog plugin version, then compares
+   the tag itself, `v` prefix included, against the catalog source ref.
    Each mismatch is reported as its own annotation and the job fails; nothing is
    published.
 
 4. **The same gate a pull request passes runs against the tag.** `release.yml`
    calls `ci.yml` through `workflow_call` rather than copying its jobs, so the
    tagged tree passes the identical checks. `install-check` also runs on a tag
-   push — it is skipped on pull requests, so this is where the documented
-   `omp plugin install github:pashifika/omp-codebase-memory#<ref>` command is
-   verified against the exact ref an operator can install.
+   push — it is skipped on pull requests. So this is where the documented
+   install command is verified against the exact ref an operator can install:
+   the job builds the ref-qualified form of it,
+   `github:pashifika/omp-codebase-memory#<ref>`, from the pushed tag.
 
 5. **The publish job creates the GitHub release.** It runs only after both the
    version gate and the reused checks succeed. It is the one job that elevates to
