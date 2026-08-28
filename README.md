@@ -351,11 +351,26 @@ regenerates nothing on your machine.
 
 ```bash
 bun install                # --frozen-lockfile in CI
+bun run dev:install        # link the checkout, register the catalog, wire MCP
 bun run typecheck
 bun run test:unit          # no CBM executable, no network
 bun run test:packaging     # rebuilds both bundles, then loads them
 bun run build              # commit the result
 ```
+
+`bun run dev:install` is the whole setup step for a checkout. It rebuilds both
+bundles, runs `omp plugin link .`, registers this repository's own marketplace
+catalog so `omp plugin discover` and `omp plugin upgrade` have something to
+read, writes the owned MCP entry without waiting for the next session start, and
+then reports what resolves. It is idempotent, and it refuses rather than
+replacing a registration that came from somewhere other than your checkout.
+
+Two things it will not do. It never downloads a CBM executable: `/cbm install`
+asks for confirmation when a system copy already resolves, and answering that
+for you would decide which executable your account's index belongs to. It never
+installs from the catalog it registers, because that resolves the catalog's ref
+and so needs a published release. Add `--no-build`, `--no-marketplace`,
+`--no-mcp`, or `--force` to skip or override a step.
 
 Run `bun run build` after changing anything under `src/`. CI rejects a committed
 bundle that is not byte-identical to one built from the current source.

@@ -25,6 +25,7 @@
   },
   "scripts": {
     "build": "bun build src/index.ts --target=bun --format=esm --outfile=dist/index.js && bun build src/augment-entry.ts --target=bun --format=esm --outfile=dist/augment.js",
+    "dev:install": "bun run scripts/dev-install.ts",
     "harvest": "bun run scripts/harvest.ts",
     "test": "bun test",
     "test:unit": "bun test test/unit",
