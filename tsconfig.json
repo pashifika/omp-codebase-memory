@@ -1,0 +1,43 @@
+{
+  // Type checking only. Bun executes TypeScript directly and `bun build`
+  // produces `dist/index.js`, so this project never emits through tsc:
+  // `tsc --noEmit` is the type gate, `bun test` is the behavior gate.
+  //
+  // `@types/bun` supplies every runtime type this package uses -- `Bun.which`,
+  // `Bun.spawn`, `Bun.CryptoHasher`, `Bun.file` -- so its version moves in step
+  // with the Bun version `.github/workflows/ci.yml` pins.
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "types": ["bun"],
+
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+
+    // `strict` alone permits two mistakes this package cannot afford.
+    //
+    // `noUncheckedIndexedAccess` matters for `checksums.txt` parsing and
+    // archive-member accounting, both of which index into split results whose
+    // length they have just tested; without it a wrong test still type-checks.
+    //
+    // `exactOptionalPropertyTypes` matters because the owned `mcp.json` entry
+    // must be written with absent fields *omitted* rather than present as
+    // `undefined`: `JSON.stringify` drops an explicit `undefined`, so without
+    // this flag a key the writer believes it set can silently vanish from the
+    // operator's configuration.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": true,
+
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

@@ -1,0 +1,250 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { readdir, stat } from "node:fs/promises";
+import path from "node:path";
+
+import {
+  checkUpstream,
+  CHECK_INTERVAL_MS,
+  install,
+  pin,
+  status,
+  syncEntry,
+  uninstall,
+  unpin,
+  update,
+  type Lifecycle,
+} from "../../src/lifecycle.ts";
+import { entryStatus } from "../../src/mcp-config.ts";
+import {
+  EXECUTABLE_NAME,
+  mcpConfigPath,
+  packageRoot,
+  upstreamInstallDir,
+} from "../../src/paths.ts";
+import { describeTarget, type Target } from "../../src/platform.ts";
+import { readState, updateState } from "../../src/state.ts";
+import { buildArchive, fakeSource, releaseMembers } from "../support/release.ts";
+import { dropScratch, makeScratch, writeFakeExecutable, type Scratch } from "../support/scratch.ts";
+
+import type { ReleaseSource } from "../../src/release.ts";
+
+const TARGET: Target = describeTarget(process.platform === "darwin" ? "darwin" : "linux", "arm64");
+const VERSION = "0.10.8";
+
+let scratch: Scratch;
+
+beforeEach(async () => {
+  // The lifecycle shells out to `tar`, and on macOS to `xattr` and `codesign`.
+  scratch = await makeScratch({ systemTools: true });
+});
+
+afterEach(async () => {
+  await dropScratch(scratch);
+});
+
+/** A release source serving one genuine archive for `version`. */
+async function servedSource(version: string): Promise<ReleaseSource> {
+  const archive = await buildArchive(TARGET.archive, releaseMembers(TARGET, version));
+  return fakeSource({
+    tag: `v${version}`,
+    archiveName: TARGET.archive,
+    bytes: archive.bytes,
+    publishedDigest: archive.digest,
+  });
+}
+
+async function lifecycleFor(version: string): Promise<Lifecycle> {
+  return { host: scratch.host, target: TARGET, source: await servedSource(version) };
+}
+
+/** A source whose every call fails the test: it must never be reached. */
+const forbiddenSource: ReleaseSource = {
+  latestTag: async () => {
+    throw new Error("the network was reached when it should not have been");
+  },
+  checksums: async () => {
+    throw new Error("the network was reached when it should not have been");
+  },
+  asset: async () => {
+    throw new Error("the network was reached when it should not have been");
+  },
+};
+
+describe("no lifecycle operation writes to ~/.local/bin", () => {
+  /**
+   * `~/.local/bin` is upstream's install directory. This package reads it -- it
+   * is third in the resolution order -- and must never write it: an executable
+   * there belongs to CBM's own installer and updater, whose activation path
+   * drains sessions and swaps the target transactionally.
+   */
+  test("running install, sync, check, pin, unpin and uninstall leaves it absent", async () => {
+    const lifecycle = await lifecycleFor(VERSION);
+
+    expect((await install(lifecycle)).ok).toBe(true);
+    expect((await syncEntry(lifecycle)).kind).toBe("unchanged");
+    expect((await checkUpstream(lifecycle, { force: true })).kind).not.toBe("failed");
+    expect((await pin(lifecycle, VERSION)).ok).toBe(true);
+    expect((await update(lifecycle)).ok).toBe(true);
+    expect((await unpin(lifecycle)).ok).toBe(true);
+    expect((await status(lifecycle)).resolved).not.toBeNull();
+    expect((await uninstall(lifecycle)).ok).toBe(true);
+
+    await expect(readdir(upstreamInstallDir(scratch.host))).rejects.toThrow();
+  });
+
+  test("an executable already there is neither replaced nor removed", async () => {
+    const adopted = path.join(upstreamInstallDir(scratch.host), EXECUTABLE_NAME);
+    await writeFakeExecutable(adopted, `echo "codebase-memory-mcp 0.9.0"`);
+    const before = await stat(adopted);
+    const contents = await Bun.file(adopted).text();
+
+    const lifecycle = await lifecycleFor(VERSION);
+    expect((await syncEntry(lifecycle)).kind).toBe("wired");
+    // The system copy resolves, so update only reports.
+    expect((await update(lifecycle)).message).toContain("is a system installation");
+    expect((await uninstall(lifecycle)).ok).toBe(true);
+
+    expect(await Bun.file(adopted).exists()).toBe(true);
+    expect(await Bun.file(adopted).text()).toBe(contents);
+    expect((await stat(adopted)).mtimeMs).toBe(before.mtimeMs);
+  });
+});
+
+describe("the update check is rate-limited", () => {
+  test("a check recorded under 24 hours ago makes no network request", async () => {
+    const now = Date.now();
+    await updateState(scratch.host, { lastCheckedAt: now - CHECK_INTERVAL_MS + 60_000 });
+
+    const report = await checkUpstream(
+      { host: scratch.host, target: TARGET, source: forbiddenSource },
+      { now },
+    );
+    expect(report.kind).toBe("skipped");
+  });
+
+  test("a check recorded over 24 hours ago is performed", async () => {
+    const now = Date.now();
+    await updateState(scratch.host, { lastCheckedAt: now - CHECK_INTERVAL_MS - 1 });
+
+    const report = await checkUpstream(
+      { host: scratch.host, target: TARGET, source: await servedSource("0.11.0") },
+      { now },
+    );
+    expect(report.kind).toBe("newer");
+    expect((await readState(scratch.host)).upstreamVersion).toBe("0.11.0");
+  });
+
+  test("a failed check is recorded so a broken network is retried daily, not per session", async () => {
+    const now = Date.now();
+    const report = await checkUpstream(
+      { host: scratch.host, target: TARGET, source: forbiddenSource },
+      { now },
+    );
+
+    expect(report.kind).toBe("failed");
+    expect((await readState(scratch.host)).lastCheckedAt).toBe(now);
+  });
+
+  test("a pinned version is reported rather than adopted", async () => {
+    const lifecycle = await lifecycleFor(VERSION);
+    await install(lifecycle);
+    await pin(lifecycle, VERSION);
+
+    const newer = { host: scratch.host, target: TARGET, source: await servedSource("0.11.0") };
+    const report = await checkUpstream(newer, { force: true });
+    expect(report.kind).toBe("newer");
+    expect(report.message).toContain("is pinned");
+
+    // The pin holds: `update` reports and adopts nothing.
+    expect((await update(newer)).message).toContain("is pinned");
+    expect((await readState(scratch.host)).managedVersion).toBe(VERSION);
+  });
+});
+
+describe("install wires the MCP entry", () => {
+  test("the entry names the adopted absolute path and re-running changes nothing", async () => {
+    const lifecycle = await lifecycleFor(VERSION);
+    const first = await install(lifecycle);
+    expect(first.ok).toBe(true);
+
+    const file = mcpConfigPath(scratch.host);
+    const written = await Bun.file(file).text();
+    const state = await readState(scratch.host);
+    const adopted = path.join(packageRoot(scratch.host), "bin", VERSION, EXECUTABLE_NAME);
+
+    expect(state.wroteCommand).toBe(adopted);
+    expect((await entryStatus(scratch.host, adopted)).current).toBe(true);
+
+    expect((await syncEntry(lifecycle)).kind).toBe("unchanged");
+    expect(await Bun.file(file).text()).toBe(written);
+  });
+
+  test("a managed update moves the entry and says the session needs a reload", async () => {
+    await install(await lifecycleFor(VERSION));
+    const report = await update(await lifecycleFor("0.11.0"));
+
+    expect(report.ok).toBe(true);
+    expect(report.message).toContain("/mcp reload");
+    expect((await readState(scratch.host)).managedVersion).toBe("0.11.0");
+  });
+});
+
+describe("uninstall", () => {
+  test("removes the managed copy, its state, and the owned entry", async () => {
+    const lifecycle = await lifecycleFor(VERSION);
+    await install(lifecycle);
+
+    const report = await uninstall(lifecycle);
+    expect(report.ok).toBe(true);
+    expect(report.message).toContain("removed the owned MCP entry");
+    expect(await Bun.file(packageRoot(scratch.host)).exists()).toBe(false);
+    expect((await entryStatus(scratch.host, null)).present).toBe(false);
+  });
+
+  test("leaves an unrelated MCP server in place", async () => {
+    const lifecycle = await lifecycleFor(VERSION);
+    await install(lifecycle);
+
+    const file = mcpConfigPath(scratch.host);
+    const document = JSON.parse(await Bun.file(file).text()) as {
+      mcpServers: Record<string, unknown>;
+    };
+    document.mcpServers["filesystem"] = { command: "npx", args: [] };
+    await Bun.write(file, `${JSON.stringify(document, null, 2)}\n`);
+
+    await uninstall(lifecycle);
+
+    const after = JSON.parse(await Bun.file(file).text()) as {
+      mcpServers: Record<string, unknown>;
+    };
+    expect(Object.keys(after.mcpServers)).toEqual(["filesystem"]);
+  });
+
+  test("succeeds when nothing was ever installed", async () => {
+    const report = await uninstall({ host: scratch.host, target: TARGET, source: forbiddenSource });
+    expect(report.ok).toBe(true);
+    expect(report.message).toContain("no managed copy was present");
+  });
+});
+
+describe("status", () => {
+  test("reports a managed copy that is present but not resolved", async () => {
+    await install(await lifecycleFor(VERSION));
+    await writeFakeExecutable(
+      path.join(scratch.pathDir, EXECUTABLE_NAME),
+      `echo "codebase-memory-mcp 0.9.0"`,
+    );
+
+    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource });
+    const text = report.lines.join("\n");
+
+    expect(text).toContain("source:     system (PATH)");
+    expect(text).toContain(`managed:    ${VERSION}`);
+    expect(text).toContain("(present, not resolved)");
+  });
+
+  test("names the resolved agent directory so a profile-scoped write is visible", async () => {
+    const report = await status({ host: scratch.host, target: TARGET, source: forbiddenSource });
+    expect(report.lines.join("\n")).toContain(`agent dir:  ${path.join(scratch.home, ".omp/agent")}`);
+  });
+});

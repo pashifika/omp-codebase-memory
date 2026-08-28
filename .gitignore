@@ -1,0 +1,17 @@
+# Dependencies. `bun.lock` is committed on purpose: CI installs with
+# `--frozen-lockfile`, so the lockfile is an input to the build, not scratch.
+node_modules/
+
+# Build scratch. `dist/index.js` is committed on purpose -- the README tells an
+# operator to load it directly after `git clone`, and CI verifies it is
+# byte-identical to a fresh build -- so `dist/` as a whole is NOT ignored.
+*.tsbuildinfo
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/
+
+# Local scratch used while verifying acquisition against a throwaway HOME.
+tmp/
+tmp_*
