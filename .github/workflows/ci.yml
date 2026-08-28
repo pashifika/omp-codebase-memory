@@ -309,8 +309,12 @@ jobs:
           cat "$HOME/plugins.txt"
           grep -q 'omp-codebase-memory' "$HOME/plugins.txt"
 
-  # The single status check branch protection requires. Runtime jobs are never
-  # named there, so changing the matrix never means editing the ruleset.
+  # The single status check branch protection requires. `.github/rulesets/main.json`
+  # names the literal string `ci`; nothing mechanically verifies the two agree, so
+  # renaming this job silently blocks every merge with no failing job to point at.
+  #
+  # Runtime jobs are never named there. Adding, removing, or restructuring one
+  # means editing this job's `needs` and nothing else.
   ci:
     name: ci
     needs: [hygiene, bun]
