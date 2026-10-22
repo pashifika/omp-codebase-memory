@@ -179,9 +179,13 @@ CBM configuration key for you.
 
 ## Compatibility
 
-Qualified versions: CBM **0.12.1**, OMP **18.12.6**, Bun **1.3.14**, and
-Tern **0.9.5 (2863c37)**. Verification covers the public OMP CLI and actual
+CBM **0.12.1** is tested and supported with OMP **18.12.6**, Bun **1.3.14**,
+and Tern **0.9.5 (2863c37)**. Verification covers the public OMP CLI and actual
 Tern-launched sessions, including augmentation enabled and disabled.
+
+CBM graph, MCP, and harvest behavior was exercised on Linux. On macOS, the
+0.12.1 executable was acquired and version-checked; OMP and Tern sessions used
+the Linux CBM over stdio. Native macOS CBM daemon behavior remains unverified.
 
 Tern launches OMP; it does not need a separate extension or MCP registry.
 Use the same OMP profile when installing and launching. Profiles have separate
