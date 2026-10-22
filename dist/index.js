@@ -1514,6 +1514,10 @@ function ompCodebaseMemory(pi) {
   };
   const notify = (ctx, message, type) => {
     try {
+      if (!ctx.hasUI) {
+        pi.logger.info("omp-codebase-memory: headless notification", { type, message });
+        return;
+      }
       ctx.ui.notify(message, type);
     } catch (error) {
       pi.logger.error("omp-codebase-memory: notification failed", {

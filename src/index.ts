@@ -125,6 +125,10 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
    */
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void => {
     try {
+      if (!ctx.hasUI) {
+        pi.logger.info("omp-codebase-memory: headless notification", { type, message });
+        return;
+      }
       ctx.ui.notify(message, type);
     } catch (error) {
       pi.logger.error("omp-codebase-memory: notification failed", {
