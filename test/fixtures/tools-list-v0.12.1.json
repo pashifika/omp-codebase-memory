@@ -1,6 +1,5 @@
 {
-  "jsonrpc": "2.0",
-  "id": 2,
+  "source": "CBM 0.12.1 tools/list (names only)",
   "result": {
     "tools": [
       {
@@ -19,7 +18,13 @@
         "name": "get_code_snippet"
       },
       {
+        "name": "get_file_outline"
+      },
+      {
         "name": "get_graph_schema"
+      },
+      {
+        "name": "compare_graphs"
       },
       {
         "name": "get_architecture"

@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { openGraphClient, QUERY_TIMEOUT_MS } from "../../src/graph.ts";
 import { dropScratch, makeScratch, type Scratch } from "../support/scratch.ts";
-import { recordedStarts, writeFakeGraph, type FakeGraphOptions } from "../support/fake-graph.ts";
+import { recordedStarts, SPAWN_BUDGET_MS, writeFakeGraph, type FakeGraphOptions } from "../support/fake-graph.ts";
 
 import type { GraphClient } from "../../src/graph.ts";
 
@@ -25,19 +25,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await dropScratch(scratch);
 });
-
-/**
- * The budget for a test that spawns the fake server.
- *
- * Measured on this repository: the first execution of a freshly written script
- * through its `#!/usr/bin/env bun` shebang costs ~340 ms on an idle machine, and
- * seconds under CPU contention -- and every test here writes a new one, because
- * the options travel inlined in the script. Bun's 5 s default is therefore a
- * budget these tests can exhaust on a loaded runner while testing nothing about
- * the subject, so it is replaced by one generous enough that a timeout means the
- * client actually hung.
- */
-const SPAWN_BUDGET_MS = 30_000;
 
 /** A client over a fake server configured by `options`. */
 async function fakeClient(options: FakeGraphOptions, queryTimeoutMs = QUERY_TIMEOUT_MS): Promise<GraphClient> {

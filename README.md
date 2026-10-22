@@ -4,13 +4,13 @@ Installs and updates [`codebase-memory-mcp`](https://github.com/DeusData/codebas
 for [OMP](https://github.com/can1357/oh-my-pi), and wires it into the MCP
 configuration your sessions already read.
 
-`codebase-memory-mcp` (CBM) indexes a repository into a persistent code
-knowledge graph and serves it over MCP. Its own installer configures dozens of
-editor and CLI clients, and OMP is not one of them. On an OMP-only machine, CBM
-is reachable only if some *other* client's installation happened to leave a
-Claude, Codex, or Gemini config behind for OMP to discover. This extension
-supplies that route: one `omp plugin install`, and the graph is reachable, kept
-in step, and described to the session that uses it.
+`codebase-memory-mcp` (CBM) indexes repositories into a persistent code knowledge
+graph and serves it over MCP. CBM 0.12.1 can configure OMP directly with MCP,
+a skill, and agents.
+This extension adds OMP-managed installation and updates, explicit executable
+ownership, generated context, and optional graph augmentation of tool results.
+Choose the native installer for MCP/context alone; choose this package for its
+lifecycle commands and result augmentation.
 
 ## Features
 
@@ -38,6 +38,7 @@ in step, and described to the session that uses it.
 - [Install](#install)
 - [Commands](#commands)
 - [Configuration](#configuration)
+- [Compatibility](#compatibility)
 - [Why a system installation always wins](#why-a-system-installation-always-wins)
 - [Graph context in a session](#graph-context-in-a-session)
 - [Where things live](#where-things-live)
@@ -56,8 +57,9 @@ Install from the git spec. This is the supported primary route:
 omp plugin install github:pashifika/omp-codebase-memory
 ```
 
-Nothing else is needed. The extension resolves an executable, wires the MCP
-entry at the next session start, and tells you what it did.
+Start a new OMP session after installation. The extension resolves an existing
+executable and wires its MCP entry. If none resolves, run `/cbm install`, then
+reload the session to discover the newly registered MCP server.
 
 To install without the optional result augmentation, name an empty feature
 selection:
@@ -123,9 +125,9 @@ Everything is one command with subcommands. `/cbm` on its own reports status.
 A status report reads as one labelled line per fact, so a stale MCP entry or an
 unindexed directory is visible without running anything else.
 
-No command needs an interactive terminal. In a session with no UI, `/cbm
-install` reports the reason and stops rather than waiting for a confirmation
-that cannot arrive.
+No command waits for confirmation when the session has no UI. If `/cbm install`
+would need confirmation, it stops without downloading. Headless command reports,
+including the refusal reason, go to OMP's logs (default: `~/.omp/logs`).
 
 ### Indexing is the agent's work
 
@@ -162,7 +164,7 @@ writing every profile would configure profiles you never asked about — and
 
 CBM's own behaviour is CBM's configuration, not this package's. Three of its
 defaults decide what you see on a new machine, as
-`codebase-memory-mcp config --help` prints them at 0.10.8 — that command reports
+`codebase-memory-mcp config --help` prints them at 0.12.1 — that command reports
 the default beside each key, where `config list` reports your effective values:
 
 | Key | Default | What it means |
@@ -174,6 +176,35 @@ the default beside each key, where `config list` reports your effective values:
 The practical shape: the first index is explicit, and staying current after that
 is not. Change these through CBM's own `config set`; this package never writes a
 CBM configuration key for you.
+
+## Compatibility
+
+CBM **0.12.1** is tested and supported with OMP **18.12.6**, Bun **1.3.14**,
+and Tern **0.9.5 (2863c37)**. Verification covers the public OMP CLI and actual
+Tern-launched sessions, including augmentation enabled and disabled.
+
+CBM graph, MCP, and harvest behavior was exercised on Linux. On macOS, the
+0.12.1 executable was acquired and version-checked; OMP and Tern sessions used
+the Linux CBM over stdio. Native macOS CBM daemon behavior remains unverified.
+
+Tern launches OMP; it does not need a separate extension or MCP registry.
+Use the same OMP profile when installing and launching. Profiles have separate
+plugin registrations as well as separate agent directories:
+
+```bash
+OMP_PROFILE=work omp plugin install github:pashifika/omp-codebase-memory
+omp --profile work
+```
+
+`PI_CODING_AGENT_DIR` selects the MCP configuration directory; `/cbm status`
+reports the effective path. This package does not install or update Tern's OMP.
+
+CBM's native OMP installer supplies MCP, a skill, and agents, not this package's
+lifecycle commands or result augmentation. Native context files alone do not
+disable the extension. An MCP entry using the resolved command can be adopted;
+a foreign command is refused without changing it. The package does not delete
+native context or automatically deduplicate overlapping skill/agent sources.
+Choose one context installation route rather than expecting a migration.
 
 ## Why a system installation always wins
 
@@ -288,8 +319,8 @@ records which, and lists every path the pipeline owns:
 
 ```json
 {
-  "cbmVersion": "0.10.8",
-  "reportedVersion": "codebase-memory-mcp 0.10.8",
+  "cbmVersion": "0.12.1",
+  "reportedVersion": "codebase-memory-mcp 0.12.1",
   "sourceClients": ["claude", "augment"],
   "generated": [
     "agents/codebase-memory-auditor.md",
@@ -301,6 +332,14 @@ records which, and lists every path the pipeline owns:
   ]
 }
 ```
+
+CBM 0.12.x changes index image identity and rebuilds an existing index once when
+it next indexes that project. This package does not initiate indexing or the
+rebuild; allow CBM to complete it before relying on graph results.
+
+The 0.12.1 server exposes 17 tools, but its emitted skill still enumerates 15.
+The package preserves that upstream body. The drift check warns about missing
+referenced tools, not additional server tools.
 
 If you run a newer CBM than that, two detectors tell you, in this order.
 
@@ -334,14 +373,17 @@ regenerates nothing on your machine.
 - **`mcp.json` has two possible writers.** OMP's `/mcp add` and this package
   write the same file and share no lock. The worst outcome is a lost entry that
   the next session start rewrites — never a corrupted file.
+- **Search scopes are repository-relative.** Absolute `grep`/`glob` paths can
+  produce no graph append; the tool result remains intact. Read coverage accepts
+  absolute paths within the indexed project.
 - **Windows is unsupported.** It needs zip extraction, a different executable
   suffix, and its own path handling. It is one explicit
   unsupported-platform error rather than a half-implemented branch.
 
 ## Requirements
 
-- **Bun.** OMP's own runtime, so you already have it. CI pins 1.3.14, tracked by
-  `@types/bun` in `package.json`. No npm runtime dependencies.
+- **Bun 1.3.14 or newer**, required by the qualified OMP SDK. CI and
+  `@types/bun` pin 1.3.14. No npm runtime dependencies.
 - **`tar`**, for archive extraction.
 - **`xattr` and `codesign`** on macOS, both from a default install. A missing
   one is reported as a named prerequisite rather than a mysterious failure.

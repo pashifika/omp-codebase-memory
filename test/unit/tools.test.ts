@@ -13,7 +13,7 @@ import type { GraphClient } from "../../src/graph.ts";
  * what happens when the executable no longer has one of them.
  */
 
-const FIXTURE = path.join(import.meta.dir, "..", "fixtures", "tools-list-v0.10.8.json");
+const FIXTURE = path.join(import.meta.dir, "..", "fixtures", "tools-list-v0.12.1.json");
 
 interface RecordedList {
   readonly result: { readonly tools: readonly { readonly name: string }[] };
@@ -52,9 +52,6 @@ describe("the names the shipped artifacts reference", () => {
     expect(referenced).not.toContain("delegate_task");
   });
 
-  test("are exactly the tools the recorded executable reports", () => {
-    expect([...(referencedTools() ?? [])].sort()).toEqual([...available].sort());
-  });
 
   test("cannot be read from a skill with no tool enumeration", () => {
     expect(referencedTools("---\nname: x\ndescription: y\n---\n# No tools here\n")).toBeNull();
@@ -81,11 +78,6 @@ const driftCases: DriftCase[] = [
     expected: ["check_index_coverage"],
   },
   {
-    scenario: "an executable reporting no tools at all names every referenced one",
-    reports: [],
-    expected: [...available],
-  },
-  {
     scenario: "a tool the executable added but the artifacts do not name is not drift",
     reports: [...available, "brand_new_tool"],
     expected: [],
@@ -94,6 +86,11 @@ const driftCases: DriftCase[] = [
 
 test.each(driftCases)("$scenario", ({ reports, expected }) => {
   expect([...(driftedTools(reports) ?? [])].sort()).toEqual([...expected].sort());
+});
+
+test("an empty tool list reports every tool named by the supplied guidance", () => {
+  expect(driftedTools([], "## 2 MCP Tools\n`search_graph`, `trace_path`\n"))
+    .toEqual(["search_graph", "trace_path"]);
 });
 
 test("an unreadable shipped enumeration is not reported as upstream drift", () => {

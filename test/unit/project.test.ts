@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
 
+import { openGraphClient } from "../../src/graph.ts";
 import { projectResolver, readProjects, selectProject } from "../../src/project.ts";
+import { SPAWN_BUDGET_MS, writeFakeGraph } from "../support/fake-graph.ts";
+import { dropScratch, makeScratch } from "../support/scratch.ts";
 
 import type { GraphClient } from "../../src/graph.ts";
 import type { IndexedProject } from "../../src/project.ts";
@@ -204,3 +207,28 @@ test("a directory outside every recorded root resolves to unindexed, not an erro
   const resolver = projectResolver(countingClient({ projects: [{ name: "app", root_path: "/work/app" }] }), "/tmp/x");
   expect(await resolver.resolve()).toEqual({ kind: "unindexed" });
 });
+
+/**
+ * CBM 0.11+ answers `list_projects` with tree text and no `structuredContent`
+ * unless JSON is selected; against such a server the resolver reported every
+ * indexed session as `unavailable`.
+ */
+test("a server defaulting to tree output still resolves the indexed project", async () => {
+  const scratch = await makeScratch();
+  const executable = path.join(scratch.root, "fake-graph");
+  await writeFakeGraph(executable, {
+    treeDefault: ["list_projects"],
+    tools: { list_projects: { projects: [{ name: "app", root_path: "/work/app" }] } },
+  });
+  const client = openGraphClient(executable);
+  try {
+    await client.toolNames();
+    expect(await projectResolver(client, "/work/app/src").resolve()).toEqual({
+      kind: "project",
+      project: project("app", "/work/app"),
+    });
+  } finally {
+    client.close();
+    await dropScratch(scratch);
+  }
+}, SPAWN_BUDGET_MS);

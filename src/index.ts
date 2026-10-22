@@ -74,11 +74,8 @@ const SUBCOMMANDS = [
 export default function ompCodebaseMemory(pi: ExtensionAPI): void {
   const host = processHost();
 
-  // A future upstream `--clients=omp` would write its own native extension to
-  // this path. Extension modules are deduplicated by absolute path, so both
-  // would load and a later change's output augmentation would be applied twice.
-  // Cheap to check now; impossible to retrofit once the duplicate is in the
-  // field.
+  // Stand down only for an actual competing extension at this path. CBM 0.12.1
+  // native OMP setup installs MCP/skill/agents, not an extension.
   const native = nativeExtensionPath(host);
   if (existsSync(native)) {
     pi.logger.info("omp-codebase-memory: standing down", { native });
@@ -128,6 +125,11 @@ export default function ompCodebaseMemory(pi: ExtensionAPI): void {
    */
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void => {
     try {
+      if (!ctx.hasUI) {
+        const level = type === "warning" ? "warn" : type;
+        pi.logger[level]("omp-codebase-memory: headless notification", { type, message });
+        return;
+      }
       ctx.ui.notify(message, type);
     } catch (error) {
       pi.logger.error("omp-codebase-memory: notification failed", {

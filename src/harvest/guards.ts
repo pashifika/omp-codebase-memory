@@ -25,16 +25,11 @@ const NOT_RUNNING = "daemon: not running";
 /** The line `daemon status` prints when something is. */
 const RUNNING = "daemon: active";
 
-/**
- * What `daemon status` reported, read out of its combined output.
- *
- * Anything that is not an explicit "not running" is {@link DaemonState}
- * `unknown` rather than inactive, so a changed output shape cannot be read as
- * permission to stop the operator's sessions.
- */
-export function classifyDaemonStatus(reported: string): DaemonState {
+/** CBM reports an absent daemon with exit 1; other failures remain unknown. */
+export function classifyDaemonStatus(reported: string, exitCode: number): DaemonState {
+  if (exitCode !== 0 && exitCode !== 1) return "unknown";
   if (reported.includes(NOT_RUNNING)) return "inactive";
-  if (reported.includes(RUNNING)) return "active";
+  if (exitCode === 0 && reported.includes(RUNNING)) return "active";
   return "unknown";
 }
 

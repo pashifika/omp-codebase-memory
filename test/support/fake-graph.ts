@@ -54,6 +54,11 @@ export interface FakeGraphOptions {
   /** Answer `list_projects` with the environment the process was given. */
   readonly echoEnv?: boolean;
   /**
+   * Tools that, like CBM 0.11+, answer tree text without `structuredContent`
+   * unless the call selects `format: "json"`.
+   */
+  readonly treeDefault?: readonly string[];
+  /**
    * A file each started stdio session appends its pid to.
    *
    * The only way a test can tell "did not retry" from "retried and failed
@@ -78,6 +83,19 @@ export async function writeFakeGraph(file: string, options: FakeGraphOptions = {
   await Bun.write(file, `#!/usr/bin/env bun\nconst options = ${JSON.stringify(options)};\n${SERVER}`);
   await chmod(file, 0o755);
 }
+
+/**
+ * The budget for a test that spawns the fake server.
+ *
+ * Measured on this repository: the first execution of a freshly written script
+ * through its `#!/usr/bin/env bun` shebang costs ~340 ms on an idle machine, and
+ * seconds under CPU contention -- and every test writes a new one, because the
+ * options travel inlined in the script. Bun's 5 s default is therefore a budget
+ * these tests can exhaust on a loaded runner while testing nothing about the
+ * subject, so it is replaced by one generous enough that a timeout means the
+ * client actually hung.
+ */
+export const SPAWN_BUDGET_MS = 30_000;
 
 /**
  * The pids of the sessions a fake with `startLog` has started, in order.
@@ -156,6 +174,10 @@ process.stdin.on("data", async (chunk) => {
 
       if (options.echoEnv === true && tool === "list_projects") {
         send({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { env: process.env }, isError: false } });
+        continue;
+      }
+      if (options.treeDefault?.includes(tool) && request.params?.arguments?.format !== "json") {
+        send({ jsonrpc: "2.0", id: request.id, result: { content: [{ type: "text", text: tool + " tree" }], isError: false } });
         continue;
       }
       const answer = options.tools?.[tool];
