@@ -73,11 +73,8 @@ export function mcpConfigPath(host: Host): string {
 }
 
 /**
- * The path a future upstream `--clients=omp` would write its own extension to.
- *
- * Checked on load so a CBM-written native extension and this package's entry
- * cannot both apply the next change's output augmentation. Extension modules
- * are deduplicated by absolute path, so both would load.
+ * A competing extension's path, checked on load to avoid duplicate augmentation.
+ * CBM 0.12.1 native OMP setup installs MCP/skill/agents, not this extension.
  */
 export function nativeExtensionPath(host: Host): string {
   return path.join(agentDir(host), "extensions", "codebase-memory.ts");

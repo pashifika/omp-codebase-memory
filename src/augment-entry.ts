@@ -42,9 +42,7 @@ const WARM_DELAY_MS = 0;
 export default function ompCodebaseMemoryAugmentation(pi: ExtensionAPI): void {
   const host = processHost();
 
-  // Same stand-down as the main entry. A future upstream `--clients=omp` would
-  // write its own native extension, and OMP deduplicates extension modules by
-  // absolute path, so both would load and every search would be augmented twice.
+  // Same competing-extension guard as the main entry, not a native-context guard.
   const native = nativeExtensionPath(host);
   if (existsSync(native)) {
     pi.logger.info("omp-codebase-memory: augmentation standing down", { native });

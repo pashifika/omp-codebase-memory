@@ -1,6 +1,6 @@
 {
-  "cbmVersion": "0.10.8",
-  "reportedVersion": "codebase-memory-mcp 0.10.8",
+  "cbmVersion": "0.12.1",
+  "reportedVersion": "codebase-memory-mcp 0.12.1",
   "sourceClients": [
     "claude",
     "augment"

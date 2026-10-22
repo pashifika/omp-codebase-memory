@@ -47,7 +47,7 @@ function projectResolver(client, cwd) {
         return settled;
       inFlight ??= (async () => {
         try {
-          const projects = readProjects(await client.call("list_projects", {}));
+          const projects = readProjects(await client.call("list_projects", { format: "json" }));
           if (projects === null)
             return { kind: "unavailable" };
           const project = selectProject(projects, cwd);
@@ -314,7 +314,7 @@ async function coverageFor(client, project, root, input, cwd) {
   const relative = path2.relative(root, path2.resolve(cwd, target.split(":")[0] ?? target));
   if (relative === "" || relative.startsWith("..") || path2.isAbsolute(relative))
     return null;
-  const structured = await client.call("check_index_coverage", { project, paths: [relative] });
+  const structured = await client.call("check_index_coverage", { project, paths: [relative], format: "json" });
   if (typeof structured !== "object" || structured === null || !("paths" in structured))
     return null;
   const reported = structured.paths;

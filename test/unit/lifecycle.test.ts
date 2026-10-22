@@ -454,11 +454,15 @@ describe("uninstall", () => {
 
     // Each of these is a place CBM's own data lives, and none is under the root
     // this command deletes: the cache holding the shared index, the agent
-    // directory holding other extensions' configuration, and upstream's own
-    // install directory holding an executable this package only ever adopts.
+    // directory holding native context and other extensions' configuration, and
+    // upstream's install directory holding an executable this package only adopts.
     const foreign = [
       path.join(scratch.home, ".cache", "codebase-memory", "graph.db"),
       path.join(agentDir(scratch.host), "another-extension.json"),
+      path.join(agentDir(scratch.host), "skills", "codebase-memory", "SKILL.md"),
+      path.join(agentDir(scratch.host), "agents", "codebase-memory.md"),
+      path.join(agentDir(scratch.host), "agents", "codebase-memory-scout.md"),
+      path.join(agentDir(scratch.host), "agents", "codebase-memory-auditor.md"),
       path.join(upstreamInstallDir(scratch.host), EXECUTABLE_NAME),
     ];
     for (const file of foreign) await Bun.write(file, "belongs to something else");
@@ -466,7 +470,7 @@ describe("uninstall", () => {
     expect((await uninstall(lifecycle)).ok).toBe(true);
 
     expect(await Bun.file(packageRoot(scratch.host)).exists()).toBe(false);
-    for (const file of foreign) expect(await Bun.file(file).exists()).toBe(true);
+    for (const file of foreign) expect(await Bun.file(file).text()).toBe("belongs to something else");
   });
 
   /**

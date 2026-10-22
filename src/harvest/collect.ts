@@ -31,13 +31,7 @@ import { HarvestError } from "./transform.ts";
  */
 export const SOURCE_CLIENTS = ["claude", "augment"] as const;
 
-/**
- * The directories CBM looks for before it will configure a client.
- *
- * A scratch `HOME` detects nothing, so the pipeline creates exactly these two
- * and gets exactly two configured clients. Observed: without them, `install`
- * reports `Detected agents: (none)` and emits nothing at all.
- */
+/** Source-client directories created only inside the harvest's scratch HOME. */
 const DETECTION_DIRS = [".claude", ".augment"] as const;
 
 /** Where the skill body is emitted, relative to the temporary `HOME`. */
@@ -70,8 +64,8 @@ const AGENT_SOURCES = [
  */
 export async function daemonState(executable: string): Promise<DaemonState> {
   const status = await run([executable, "daemon", "status"], { timeoutMs: 30_000 });
-  if (!status.ok || status.spawnError !== undefined) return "unknown";
-  return classifyDaemonStatus(`${status.stdout}${status.stderr}`);
+  if (status.spawnError !== undefined) return "unknown";
+  return classifyDaemonStatus(`${status.stdout}${status.stderr}`, status.exitCode);
 }
 
 /** The emitted content each shipped artifact is derived from. */
@@ -108,6 +102,8 @@ export async function collect(executable: string): Promise<EmittedSources> {
     for (const directory of DETECTION_DIRS) {
       await mkdir(path.join(home, directory), { recursive: true });
     }
+    // CBM 0.12.1 requires a Claude config file, not just its directory.
+    await Bun.write(path.join(home, ".claude", "settings.json"), "{}\n");
 
     const install = await run(
       [
@@ -134,7 +130,11 @@ export async function collect(executable: string): Promise<EmittedSources> {
         // -- decided once in `scripts/harvest.ts`, before the first invocation
         // of `install` -- and on `HOME`, never on CBM declining. The indexed
         // projects survived it: the graph is in the cache, not in the process.
-        env: { HOME: home, CBM_CACHE_DIR: path.join(home, "cache") },
+        env: {
+          HOME: home,
+          CBM_CACHE_DIR: path.join(home, "cache"),
+          CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+        },
       },
     );
 

@@ -4,13 +4,12 @@ Installs and updates [`codebase-memory-mcp`](https://github.com/DeusData/codebas
 for [OMP](https://github.com/can1357/oh-my-pi), and wires it into the MCP
 configuration your sessions already read.
 
-`codebase-memory-mcp` (CBM) indexes a repository into a persistent code
-knowledge graph and serves it over MCP. Its own installer configures dozens of
-editor and CLI clients, and OMP is not one of them. On an OMP-only machine, CBM
-is reachable only if some *other* client's installation happened to leave a
-Claude, Codex, or Gemini config behind for OMP to discover. This extension
-supplies that route: one `omp plugin install`, and the graph is reachable, kept
-in step, and described to the session that uses it.
+CBM indexes repositories into a persistent code knowledge graph and serves it
+over MCP. CBM 0.12.1 can configure OMP directly with MCP, a skill, and agents.
+This extension adds OMP-managed installation and updates, explicit executable
+ownership, generated context, and optional graph augmentation of tool results.
+Choose the native installer for MCP/context alone; choose this package for its
+lifecycle commands and result augmentation.
 
 ## Features
 
@@ -56,8 +55,9 @@ Install from the git spec. This is the supported primary route:
 omp plugin install github:pashifika/omp-codebase-memory
 ```
 
-Nothing else is needed. The extension resolves an executable, wires the MCP
-entry at the next session start, and tells you what it did.
+Start a new OMP session after installation. The extension resolves an existing
+executable and wires its MCP entry. If none resolves, run `/cbm install`, then
+reload the session to discover the newly registered MCP server.
 
 To install without the optional result augmentation, name an empty feature
 selection:
@@ -288,8 +288,8 @@ records which, and lists every path the pipeline owns:
 
 ```json
 {
-  "cbmVersion": "0.10.8",
-  "reportedVersion": "codebase-memory-mcp 0.10.8",
+  "cbmVersion": "0.12.1",
+  "reportedVersion": "codebase-memory-mcp 0.12.1",
   "sourceClients": ["claude", "augment"],
   "generated": [
     "agents/codebase-memory-auditor.md",

@@ -658,7 +658,8 @@ async function coverageFor(
   const relative = path.relative(root, path.resolve(cwd, target.split(":")[0] ?? target));
   if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
 
-  const structured = await client.call("check_index_coverage", { project, paths: [relative] });
+  // JSON explicitly: CBM 0.11+ defaults to tree text without structuredContent.
+  const structured = await client.call("check_index_coverage", { project, paths: [relative], format: "json" });
   if (typeof structured !== "object" || structured === null || !("paths" in structured)) return null;
   const reported = structured.paths;
   if (!Array.isArray(reported)) return null;

@@ -113,7 +113,8 @@ export function projectResolver(client: GraphClient, cwd: string): ProjectResolv
           // No cache-root override, here or anywhere: CBM refuses a command
           // configured against a root other than the active daemon's, and that
           // root is the only one holding the index this session can see.
-          const projects = readProjects(await client.call("list_projects", {}));
+          // JSON explicitly: CBM 0.11+ defaults to tree text without structuredContent.
+          const projects = readProjects(await client.call("list_projects", { format: "json" }));
           if (projects === null) return { kind: "unavailable" };
           // An empty list and no match are the same state -- no indexed project
           // -- and neither is an error.

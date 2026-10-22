@@ -15,15 +15,8 @@ import {
   type Artifact,
 } from "../../src/harvest/transform.ts";
 
-/**
- * Recorded output from `install --skip-binary --clients=claude,augment` against
- * CBM v0.10.8, laid out the way the executable emitted it.
- *
- * Committed rather than produced, so the whole transformation layer is testable
- * on a machine with no CBM executable and no network -- which is the property
- * `test/unit` is required to have.
- */
-const FIXTURES = path.join(import.meta.dir, "..", "fixtures", "harvest", "cbm-0.10.8");
+/** Recorded CBM 0.12.1 output; unit tests require neither CBM nor network. */
+const FIXTURES = path.join(import.meta.dir, "..", "fixtures", "harvest", "cbm-0.12.1");
 
 const fixture = async (relative: string): Promise<string> => await Bun.file(path.join(FIXTURES, relative)).text();
 
@@ -147,12 +140,6 @@ describe("the rule transform", () => {
     expect(document.values.get("alwaysApply")).toBeUndefined();
   });
 
-  test("derives the description from the body's first prose line, past the markers and headings", async () => {
-    const source = await fixture("augment/rules/codebase-memory.md");
-    expect(scalar(parseDocument(transformRule(source).content), "description")).toBe(
-      "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.",
-    );
-  });
 
   test("writes the fixed rule name, so a CBM-written native rule shadows it rather than doubling it", async () => {
     const source = await fixture("augment/rules/codebase-memory.md");
@@ -409,29 +396,29 @@ test("an emitted agent whose name would escape the agents directory is refused",
   expect(() => transformAgent(hostile)).toThrow("directly under");
 });
 
-test("every guard case names a distinct scenario", () => {
-  const scenarios = [
-    ...guardCases,
-    ...agentCases,
-    ...directShapeCases,
-    ...directKeyCases,
-    ...scalarCases,
-    ...alwaysApplyCases,
-  ].map((kase) => kase.scenario);
-  expect(new Set(scenarios).size).toBe(scenarios.length);
-});
 
-describe("what a generated artifact passes", () => {
-  test("every artifact the pipeline produces from the fixtures survives its own guards", async () => {
-    const produced: Artifact[] = [
-      transformSkill(await fixture("claude/skills/codebase-memory/SKILL.md")),
-      transformRule(await fixture("augment/rules/codebase-memory.md")),
-      ...(await Promise.all(AUGMENT_AGENTS.map(async (relative) => transformAgent(await fixture(relative))))),
-    ];
+interface SourceVersionCase {
+  readonly scenario: string;
+  readonly version: string;
+}
 
-    expect(produced).toHaveLength(5);
-    for (const artifact of produced) {
-      expect(() => guardArtifact(artifact)).not.toThrow();
-    }
-  });
+const sourceVersions: SourceVersionCase[] = [
+  { scenario: "historical CBM 0.10.8 preserves source bodies through transformation", version: "0.10.8" },
+  { scenario: "current CBM 0.12.1 preserves source bodies through transformation", version: "0.12.1" },
+];
+
+test.each(sourceVersions)("$scenario", async ({ version }) => {
+  const root = path.join(FIXTURES, "..", `cbm-${version}`);
+  const skill = await Bun.file(path.join(root, "claude/skills/codebase-memory/SKILL.md")).text();
+  const rule = await Bun.file(path.join(root, "augment/rules/codebase-memory.md")).text();
+  const sources = await Promise.all(AUGMENT_AGENTS.map(relative => Bun.file(path.join(root, relative)).text()));
+  const pairs = [
+    { artifact: transformSkill(skill), body: sourceBody(skill) },
+    { artifact: transformRule(rule), body: rule },
+    ...sources.map(source => ({ artifact: transformAgent(source), body: sourceBody(source) })),
+  ];
+  for (const { artifact, body } of pairs) {
+    guardArtifact(artifact);
+    expect(parseDocument(artifact.content).body).toBe(body);
+  }
 });

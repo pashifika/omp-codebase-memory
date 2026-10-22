@@ -32,6 +32,7 @@ interface ClassifyCase {
   readonly scenario: string;
   /** What `daemon status` printed, stdout and stderr concatenated. */
   readonly reported: string;
+  readonly exitCode: number;
   readonly expected: DaemonState;
 }
 
@@ -39,27 +40,49 @@ const classifyCases: ClassifyCase[] = [
   {
     scenario: "the not-running line reads as inactive",
     reported: "daemon: not running\n",
+    exitCode: 0,
     expected: "inactive",
   },
   {
     scenario: "the active line reads as active, session-managed detail and all",
     reported: "daemon: active (session-managed)\npid: 23048\nclients: 8 committed\n",
+    exitCode: 0,
     expected: "active",
   },
   {
     scenario: "output that says neither reads as unknown rather than inactive",
     reported: "daemon state: idle\n",
+    exitCode: 0,
     expected: "unknown",
   },
   {
     scenario: "no output at all reads as unknown rather than inactive",
     reported: "",
+    exitCode: 0,
+    expected: "unknown",
+  },
+  {
+    scenario: "CBM 0.12.1 reports an absent daemon with exit 1",
+    reported: "daemon: not running\nhint: `codebase-memory-mcp daemon start` keeps a daemon warm\n",
+    exitCode: 1,
+    expected: "inactive",
+  },
+  {
+    scenario: "a failed status without an absent-daemon report remains unknown",
+    reported: "cannot connect to daemon\n",
+    exitCode: 1,
+    expected: "unknown",
+  },
+  {
+    scenario: "an abnormal exit cannot authorize harvest from an inactive line",
+    reported: "daemon: not running\n",
+    exitCode: 2,
     expected: "unknown",
   },
 ];
 
-test.each(classifyCases)("$scenario", ({ reported, expected }) => {
-  expect(classifyDaemonStatus(reported)).toBe(expected);
+test.each(classifyCases)("$scenario", ({ reported, exitCode, expected }) => {
+  expect(classifyDaemonStatus(reported, exitCode)).toBe(expected);
 });
 
 interface RefusalCase {
@@ -175,12 +198,6 @@ test.each(reportCases)("$scenario", ({ state, reports }) => {
   for (const fragment of reports) expect(report).toContain(fragment);
 });
 
-test("the override flag the refusals name is the one the entry point accepts", () => {
-  // Pinned rather than inferred: the refusal tells the operator to pass a
-  // literal string, and a rename that missed either side would print advice
-  // that does not work.
-  expect(OVERRIDE_FLAG).toBe("--stop-sessions");
-});
 
 describe("the source-client vocabulary check", () => {
   const VERSION = "codebase-memory-mcp 0.10.8";

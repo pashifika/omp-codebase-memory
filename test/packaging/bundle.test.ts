@@ -48,10 +48,9 @@ const featureEntries = Object.values(manifest.omp?.features ?? {}).flatMap((feat
  * loading *runs* the factory, which stands down when
  * `<agent-dir>/extensions/codebase-memory.ts` exists, so against the
  * developer's real agent directory every assertion below is decided by state
- * outside this repository -- and would go red the day upstream ships the native
- * extension that guard exists to detect, for a reason having nothing to do with
- * the bundle. The scratch directory is the agent directory too; it holds the one
- * bundle under test and nothing else, which is what the assertion below proves.
+ * outside this repository. This detects a competing extension, not CBM 0.12.1's
+ * native OMP setup, which installs MCP/skill/agents. The scratch directory holds
+ * only the bundle under test, as the assertion below proves.
  */
 async function loadIsolated(bundle: string): Promise<LoadExtensionsResult> {
   const directory = await mkdtemp(join(tmpdir(), "cbm-bundle-"));

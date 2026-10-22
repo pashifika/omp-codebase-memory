@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import path from "node:path";
 
 import { createAugmenter } from "../../src/augment.ts";
+import { openGraphClient } from "../../src/graph.ts";
+import { SPAWN_BUDGET_MS, writeFakeGraph } from "../support/fake-graph.ts";
+import { dropScratch, makeScratch } from "../support/scratch.ts";
 
 import type { AugmentDeps } from "../../src/augment.ts";
 import type { GraphClient } from "../../src/graph.ts";
@@ -496,6 +500,33 @@ describe("what the augmentation adds", () => {
     expect(probe?.args["paths"]).toEqual(["src/a.ts"]);
     under.close();
   });
+
+  /** CBM 0.11+ answers both tools with tree text and no `structuredContent` unless JSON is selected. */
+  test("appends a recorded gap from a server defaulting to tree output, leaving the read untouched", async () => {
+    const scratch = await makeScratch();
+    const executable = path.join(scratch.root, "fake-graph");
+    await writeFakeGraph(executable, {
+      treeDefault: ["list_projects", "check_index_coverage"],
+      tools: { list_projects: LISTED, check_index_coverage: PARTIAL_COVERAGE },
+    });
+    const under = harness({}, openGraphClient(executable));
+    try {
+      await under.warm();
+      const event = readResult("/work/app/src/a.ts");
+      const original = [...event.content];
+
+      const result = await under.handle(event);
+
+      expect(result?.content?.slice(0, 1)).toEqual(original);
+      expect(result?.content).toHaveLength(2);
+      expect(appendedText(result)).toContain("src/a.ts: partial");
+      expect(appendedText(result)).toContain("lines 40-90");
+      expect(appendedText(result)).toContain("does not prove completeness");
+    } finally {
+      under.close();
+      await dropScratch(scratch);
+    }
+  }, SPAWN_BUDGET_MS);
 
   /**
    * The pool asked for, and the bound applied to it.

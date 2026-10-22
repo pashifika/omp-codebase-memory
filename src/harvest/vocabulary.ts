@@ -48,7 +48,11 @@ export async function clientVocabulary(executable: string): Promise<ReadonlySet<
   try {
     const probe = await run([executable, "install", "-n", "--dry-run", "--skip-binary", `--clients=${PROBE_TOKEN}`], {
       timeoutMs: 60_000,
-      env: { HOME: home, CBM_CACHE_DIR: path.join(home, "cache") },
+      env: {
+        HOME: home,
+        CBM_CACHE_DIR: path.join(home, "cache"),
+        CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+      },
     });
 
     // The rejection is the expected outcome, so a *successful* exit means the
